@@ -1517,6 +1517,10 @@ class OpsImplementationConfig:
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
+    wan_kvf_implementation: Optional[str] = field(
+        default=None,
+        metadata={"help": "Wan KVF implementation when kvf_query_blocks is positive. NCCL is the NVIDIA default."},
+    )
     moe_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={

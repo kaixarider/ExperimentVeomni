@@ -2,6 +2,9 @@ model:
   model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers/transformer
   condition_model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers
   config_path: configs/model_configs/wan/wan2.2_i2v_5b.json
+  # Optional KVF with ulysses_size > 1 and a BF16/FP16 NVIDIA runtime.
+  # model_config:
+  #   kvf_query_blocks: 4
   ops_implementation:
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
@@ -40,6 +43,12 @@ model:
 data:
   train_path: /Tom-and-Jerry-VideoGeneration-Dataset-parquet
   source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  # Optional for offline_training with a mapping dataset of Wan embeddings.
+  # anchor_batching:
+  #   lengths_path: /path/to/wan-token-lengths.json
+  #   long_boundary: 4096
+  #   max_pack_tokens: 8192
+  #   window_size: 256
   mm_configs:
     fps: 1
     max_frames: 33

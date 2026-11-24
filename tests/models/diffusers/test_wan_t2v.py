@@ -72,7 +72,8 @@ def test_wan_t2v_condition_builds_from_registered_class_without_assets(monkeypat
     assert model.config.model_type == "WanTransformer3DConditionModel"
 
 
-def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
+@pytest.mark.parametrize("pack_samples", (False, True))
+def test_wan_t2v_public_training_forward_matches_official(monkeypatch, pack_samples):
     """Compare ragged-sample predictions and mean sample loss through the public entry."""
     from veomni.models import get_model_class
 
@@ -113,6 +114,7 @@ def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
             latents=None,
             **{key: [sample[key] for sample in ours_samples] for key in samples[0]},
             training_target=targets,
+            pack_samples=pack_samples,
         )
         assert set(output.loss) == {"mse_loss"}
         assert len(output.predictions) == len(samples)

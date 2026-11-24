@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 import os
 import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
@@ -32,6 +34,12 @@ from veomni.data.multimodal.dit import (
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
+from ..data.diffusion.anchor_batching import (
+    AnchorBatchingConfig,
+    AnchorStepSampler,
+    build_anchor_dataloader,
+    plan_anchor_rounds,
+)
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
@@ -135,6 +143,9 @@ class DiTModelArguments(ModelArguments):
 @dataclass
 class DiTDataArguments(DataArguments):
     supports_torch_compile = False
+    anchor_batching: Optional[AnchorBatchingConfig] = field(
+        default=None, metadata={"help": "Plan Wan diffusion micro-batches with Anchor Batching."}
+    )
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
@@ -373,6 +384,19 @@ class DiTTrainer:
             )
             args.train.num_train_epochs = 1
 
+        if args.data.anchor_batching is not None and (
+            args.train.training_task != "offline_training"
+            or args.data.dataset_name != "mapping"
+            or args.data.dataloader.type != "native"
+            or not args.data.dataloader.drop_last
+            or not args.data.dataloader.in_order
+            or args.model.accelerator.cp_size != 1
+            or args.model.accelerator.fsdp_config.fsdp_mode != "fsdp2"
+        ):
+            raise ValueError(
+                "Wan Anchor Batching requires mapping offline training, the native in-order loader with drop_last, FSDP2, and cp_size=1."
+            )
+
         self.training_task = args.train.training_task
 
     def _build_data_transform(self):
@@ -386,11 +410,17 @@ class DiTTrainer:
                 **args.data.mm_configs,
             )
 
+    def _load_training_dataset(self):
+        self.base._build_dataset()
+
     def _build_dataset(self):
         args: VeOmniDiTArguments = self.base.args
-        self.base._build_dataset()
+        self._load_training_dataset()
         if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
             self.base.train_dataset = None
+
+        if args.data.anchor_batching is not None:
+            self._setup_anchor_plan()
 
         if self.training_task == "offline_embedding":
             if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
@@ -430,9 +460,56 @@ class DiTTrainer:
             args._train_steps = int(steps_t.item())
             self.base.train_steps = args.train_steps
 
-    def _build_dataloader(self):
-        """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
+    def _load_anchor_lengths(self, config):
+        return json.loads(Path(config.lengths_path).read_text())
+
+    def _setup_anchor_plan(self):
         args = self.base.args
+        config = args.data.anchor_batching
+        model_config = self.base.model.model_config
+        if model_config.model_type != "WanTransformer3DModel":
+            raise ValueError("Anchor Batching requires WanTransformer3DModel.")
+        self.anchor_patch_size = model_config.patch_size
+        parallel = get_parallel_state()
+        self.anchor_sampler = None
+        if not parallel.sp_enabled or parallel.sp_rank == 0:
+            self.anchor_lengths = self._load_anchor_lengths(config)
+            if not isinstance(self.anchor_lengths, list) or len(self.anchor_lengths) != len(self.base.train_dataset):
+                raise ValueError("Anchor Batching requires a JSON list of lengths in mapping-dataset order.")
+            rounds, dropped = plan_anchor_rounds(self.anchor_lengths, parallel.dp_size, parallel.sp_size, config)
+            if not rounds:
+                raise ValueError("Anchor Batching needs at least one sample per data-parallel replica.")
+            self.anchor_sampler = AnchorStepSampler(
+                rounds,
+                parallel.dp_rank,
+                parallel.dp_size,
+                args.train.gradient_accumulation_steps,
+                args.data.dataloader.shuffle,
+                args.train.seed,
+            )
+            args._train_steps = len(self.anchor_sampler)
+            self.base.train_steps = args.train_steps
+            logger.info_rank0(
+                f"Anchor Batching planned {len(rounds)} DP rounds and dropped {len(dropped)} tail samples."
+            )
+
+    def _build_dataloader(self):
+        """Build the fixed or anchor-planned DiT dataloader."""
+        args = self.base.args
+        if args.data.anchor_batching is not None:
+            self.base.train_dataloader = (
+                build_anchor_dataloader(
+                    self.base.train_dataset,
+                    self.anchor_lengths,
+                    self.anchor_patch_size,
+                    self.anchor_sampler,
+                    DiTDataCollator(),
+                    args.data.dataloader,
+                )
+                if self.anchor_sampler is not None
+                else None
+            )
+            return
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
                 dataloader_type=args.data.dataloader.type,
@@ -504,7 +581,14 @@ class DiTTrainer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = outputs.loss
-        loss_dict = {k: v / self.base.num_micro_batches for k, v in loss_dict.items()}
+        if self.base.args.data.anchor_batching is None:
+            loss_dict = {k: v / self.base.num_micro_batches for k, v in loss_dict.items()}
+        else:
+            # FSDP2 averages rank contributions. Within an SP group the loss is
+            # replicated, so weighting by dp_size yields a global sample mean.
+            dp_size = self.base.model.parallel_state.dp_size
+            loss_scale = len(micro_batch["hidden_states"]) * dp_size / self.anchor_global_count
+            loss_dict = {k: v * loss_scale for k, v in loss_dict.items()}
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
@@ -532,6 +616,8 @@ class DiTTrainer:
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
 
+        if self.base.args.data.anchor_batching is not None:
+            micro_batch["pack_samples"] = True
         with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
@@ -566,6 +652,9 @@ class DiTTrainer:
                 micro_batches = obj_list[0]
             else:
                 micro_batches = next(data_iterator)
+
+        if self.base.args.data.anchor_batching is not None:
+            micro_batches, self.anchor_global_count = micro_batches
 
         self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
@@ -639,12 +728,12 @@ class DiTTrainer:
             self.on_epoch_end()
             self.base.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-            if args.data.dataloader.use_background_prefetcher:
+            if args.data.dataloader.use_background_prefetcher and self.base.data_iterator is not None:
                 self.base.data_iterator.stop()
 
         self.on_train_end()
 
-        if args.data.dataloader.use_background_prefetcher:
+        if args.data.dataloader.use_background_prefetcher and self.base.data_iterator is not None:
             self.base.data_iterator.stop()
 
         synchronize()

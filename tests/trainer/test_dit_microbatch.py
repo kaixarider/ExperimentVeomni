@@ -365,3 +365,62 @@ def test_fused_dit_branch_resizes_schedule_and_runs_full_training_lifecycle(monk
     assert trainer.base.state.global_step == 0
     assert trainer.base._log_callback.log_dict == {}
     assert args.train.checkpoint.output_dir == "first_padding"
+
+
+def test_anchor_training_step_applies_sample_weights(monkeypatch, tmp_path):
+    from veomni.data.diffusion.anchor_batching import AnchorBatchingConfig
+
+    trainer = _trainer(monkeypatch, "offline_training", micro_batch_size=1, shuffle=False)
+    lengths = [8, 3, 2, 1]
+    dataset = [[{"latents": torch.full((1, 1, length, 1, 1), float(length))}] for length in lengths]
+    sidecar = tmp_path / "lengths.json"
+    sidecar.write_text("[8, 3, 2, 1]")
+    trainer.base.args.data.anchor_batching = AnchorBatchingConfig(str(sidecar), long_boundary=8, max_pack_tokens=8)
+    trainer.base.train_dataset = dataset
+
+    def process_condition(*, latents):
+        return {"hidden_states": latents}
+
+    model = _Model()
+    reference = copy.deepcopy(model)
+    runtime = DiTModelRuntime.__new__(DiTModelRuntime)
+    runtime.model_name = "base"
+    runtime.model = model
+    runtime.model_config = SimpleNamespace(model_type="WanTransformer3DModel", patch_size=(1, 1, 1))
+    runtime.condition_model = SimpleNamespace(process_condition=process_condition)
+    runtime.optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    runtime.lr_scheduler = torch.optim.lr_scheduler.StepLR(runtime.optimizer, step_size=1)
+    runtime.clip_grad_norm = lambda: model.weight.grad.norm()
+    trainer.base.model = runtime
+    trainer.base.state = SimpleNamespace(global_step=0)
+    trainer.base.model_fwd_context = nullcontext()
+    trainer.base.model_bwd_context = nullcontext()
+    for name in (
+        "on_step_begin",
+        "on_step_end",
+        "sync_before_train_step",
+        "_reset_async_activation_offload_if_enabled",
+        "model_reshard",
+        "_configure_hsdp_allreduce",
+    ):
+        setattr(trainer.base, name, Mock())
+
+    pack_sizes = []
+    original_forward = model.forward
+
+    def forward(*, hidden_states, pack_samples):
+        assert pack_samples
+        pack_sizes.append(len(hidden_states))
+        return original_forward(value=hidden_states)
+
+    model.forward = forward
+    trainer._setup_anchor_plan()
+    trainer._build_dataloader()
+    trainer.train_step(iter(trainer.base.train_dataloader))
+
+    loss = reference(value=[row[0]["latents"] for row in dataset]).loss["mse"]
+    loss.backward()
+    torch.optim.SGD(reference.parameters(), lr=0.001).step()
+    assert pack_sizes == [1, 3]
+    torch.testing.assert_close(model.weight, reference.weight)
+    torch.testing.assert_close(torch.tensor(trainer.base.on_step_end.call_args.kwargs["loss"]), loss.detach())

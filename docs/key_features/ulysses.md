@@ -405,3 +405,239 @@ Async Ulysses is currently consumed by:
 - Wan
 
 Support for more models will be added in future releases.
+
+## MemDual for Wan Video Diffusion
+
+Wan's DiT trainer supports two independent opt-in settings from MemDual.
+**KV-first Q-pipeline (KVF)** starts the V exchange before K and Q projection,
+starts K exchange before Q projection, and computes an initial local attention
+partial while communication is in flight. It then pipelines incoming Q blocks
+and outgoing O blocks in forward, and dO and dQ in backward. Communication
+uses NCCL asynchronous all-to-all through the VeOmni Ulysses group. The
+research prototype uses NVSHMEM one-sided transfers, so its published
+communication results apply to that implementation.
+
+**Anchor Batching** groups long and short videos across the data-parallel
+replicas. In a round with a long anchor, the longest sample is assigned
+a pack of its own. The other packs are filled under the memory budget and
+the anchor's estimated runtime. A short-only round distributes clips in
+zigzag length order under the memory budget. Wan runs each transformer
+block once per pack, with separate self- and cross-attention sequences for
+each video. Loss is averaged over all samples in the optimizer step.
+
+Merge the following settings into a Wan configuration and launch through
+`bash train.sh tasks/train_dit.py CONFIG.yaml`. Calibrate the example
+thresholds against the model, accelerator, and Ulysses degree in use.
+
+```yaml
+model:
+  model_config:
+    kvf_query_blocks: 4
+  accelerator:
+    ulysses_size: 2
+    cp_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+data:
+  train_path: /path/to/offline-wan-embeddings
+  datasets_type: mapping
+  anchor_batching:
+    lengths_path: /path/to/wan-token-lengths.json
+    long_boundary: 4096
+    max_pack_tokens: 8192
+    window_size: 256
+    runtime_coefficients: [1.0, 0.0, 0.0]
+
+train:
+  training_task: offline_training
+```
+
+- Set `kvf_query_blocks` to a positive number of blocks per local sequence
+  shard to enable KVF. The default is zero. KVF requires NVIDIA SM80+,
+  NCCL, FP16 or BF16, and an Ulysses degree greater than one that divides
+  the number of attention heads. The backend pads head dimensions from 1 to 256
+  to FlashAttention alignment while preserving the original softmax scale. It applies to Wan bidirectional video
+  self-attention. The backend defaults to `nccl` and can be selected explicitly
+  through `model.ops_implementation.wan_kvf_implementation`. The configured
+  cross-attention backend continues to handle text and image context.
+- Anchor Batching requires Wan offline embeddings, a mapping dataset,
+  the native in-order loader with `drop_last: true`, FSDP2, and `cp_size: 1`.
+  The JSON sidecar contains one positive integer per dataset row, in mapping
+  dataset order. For an offline latent of shape `[1, C, F, H, W]` with patch
+  size `[pt, ph, pw]`, use `(F // pt) * (H // ph) * (W // pw)`.
+  The loader checks each scheduled row against its metadata. Changing
+  the dataset or patch geometry requires regenerating the sidecar.
+- `max_pack_tokens` is the total token budget per DP replica before
+  sharding, with each video's length rounded up to an SP multiple.
+  Calibrate it against peak memory for your training configuration.
+  `long_boundary` is the sequence length at which the step for two
+  equal-length clips approaches twice the runtime of one clip.
+  `runtime_coefficients` estimates each sample's runtime as
+  `a * length**2 + b * length + c`, and a pack's estimate is the sum.
+- The accumulation count derived from `train.global_batch_size` and
+  `train.micro_batch_size` is the maximum number of DP rounds per optimizer
+  step. The number of videos per step varies with the plan. With shuffling
+  enabled, whole rounds are shuffled each epoch. The loader drops a final
+  tail of fewer than one sample per DP replica.
+
+For offline embeddings produced by Wan's `offline_embedding` task, the
+sidecar can be generated with VeOmni's mapping loader to preserve row order:
+
+```python
+import json
+import math
+from pathlib import Path
+
+from veomni.data import build_data_transform, build_dataset
+from veomni.data.multimodal.dit import data_transform  # Registers dit_offline.
+
+dataset = build_dataset("mapping", train_path="/path/to/offline-wan-embeddings",
+                        transform=build_data_transform("dit_offline"))
+patch_size = (1, 2, 2)  # Read the actual patch size from the Wan config.
+lengths = [
+    math.prod(n // p for n, p in zip(dataset[i][0]["latents"].shape[-3:], patch_size))
+    for i in range(len(dataset))
+]
+Path("wan-token-lengths.json").write_text(json.dumps(lengths))
+```
+
+### Benchmarking the MemDual ablation
+
+Run `scripts/profile/benchmark_memdual.py` with a Wan configuration. The
+default `benchmark.data_source: real` reads a map-style dataset of Wan
+offline embeddings from `data.train_path` and requires
+`train.training_task: offline_training`. Use `data.anchor_batching` for the
+length sidecar, memory budget, and runtime calibration. Choose
+`--benchmark.mode baseline`, `kvf`, `anchor`, or `combined`. Each invocation
+builds a fresh model and runs one ablation. To compare against fixed-runtime
+packing, provide the same `--benchmark.fixed_target_runtime` to all four
+invocations. The baseline and KVF-only runs then use greedy packing under
+that target and the Anchor memory budget, with an over-target sample in
+its own pack. If the flag is omitted, those two modes use VeOmni's
+fixed-sample loader.
+
+Use `--benchmark.reference_attention async_ulysses` for the Async Ulysses
+reference. It applies to the `baseline` and `anchor` modes, which use the
+built-in DiT async QKV and output-projection ops with the same Wan model.
+The default `ulysses` selects synchronous Ulysses. The `kvf` and
+`combined` modes use KVF. The JSON `attention` field records the selected
+path.
+
+The launcher runs the four ablations in sequence with Async Ulysses as
+the reference. With two eight-GPU nodes it sets Ulysses 8 and DP 2,
+placing four GPUs from each node in each Ulysses group. Both nodes need
+the same checkout, training YAML, data paths and Python environment.
+From node 0, with passwordless SSH to node 1, run:
+
+```bash
+bash scripts/profile/run_memdual.sh "$CONFIG" \
+    --master-addr "$MASTER_ADDR" --peer user@node1 \
+    -- --benchmark.steps 20
+```
+
+Without SSH, omit `--peer` and run the command on both nodes with
+`--node-rank 0` and `--node-rank 1`, respectively.
+Use `--modes baseline-sync` for a separate synchronous baseline.
+The launcher writes JSON under `results/memdual/` by default.
+Training and benchmark overrides go after `--`.
+Use `--benchmark.fixed_target_runtime` there for a fixed-runtime packing
+reference. Run `bash scripts/profile/run_memdual.sh --help` for the full
+launcher options.
+
+To smoke-test all four modes on four local NVIDIA GPUs with generated
+latents and text embeddings and randomly initialized Wan weights, run
+
+```bash
+bash scripts/profile/run_memdual.sh configs/dit/wan_memdual_synthetic.yaml \
+    --nodes 1 --gpus-per-node 4 --out-dir results/memdual/synthetic
+```
+
+The synthetic config starts with a two-layer model. To measure at the full
+model size, use the corresponding Wan transformer config and remove the
+size overrides under `model.model_config`. Keep `model.model_path` unset
+for random initialization. For synthetic TI2V set
+`model.condition_model_cfg.expand_timesteps: true`. With `data_source:
+synthetic`, the runner generates rows in memory from the seeded histogram
+`benchmark.synthetic.frame_counts` (entries like `"4:49"` and `"16:1"`,
+in latent frames), `latent_height`, `latent_width`, and `context_tokens`.
+Pack lengths come from the latent grid and Wan patch size. Set
+`data.anchor_batching.long_boundary`, `max_pack_tokens`, and the fixed
+target for that geometry. Keep the synthetic dataset large enough for
+the requested warmup and measurement steps.
+
+For a real-data run, use a separate offline-training YAML pointing to
+cached Wan embeddings and the matching token-length JSON. Set the output
+directory to a separate path such as `results/memdual/real`. Each result
+records its `data_source` and, for synthetic runs, the input geometry and
+frame histogram.
+
+#### Run both models and both data sources
+
+The matrix launcher takes two Wan Diffusers model paths and exactly three
+dataset roots. It pools the three datasets into one real workload per
+model and shuffles rows and their lengths together with a fixed seed.
+For each model and data source it runs `baseline`, `kvf`, `anchor`, and
+`combined`, producing 16 JSON files in total.
+
+```bash
+python scripts/profile/run_memdual_matrix.py \
+    --t2v-model /shared/models/Wan2.2-T2V-A14B-Diffusers \
+    --ti2v-model /shared/models/Wan2.2-TI2V-5B-Diffusers \
+    --datasets /shared/data/set1 /shared/data/set2 /shared/data/set3 \
+    --master-addr "$MASTER_ADDR" --peer user@node1 \
+    --out-dir /shared/results/memdual
+```
+
+The command defaults to two nodes with eight GPUs per node, DP 2 and
+Ulysses 8. It uses five warmup steps and 20 measured optimizer steps per
+experiment. The KVF-only mode also measures exposed waits in a separate
+20-step pass. Adjust the window with `--warmup-steps` and `--steps`.
+For a short run, use `--warmup-steps 1 --steps 3`. Use `--dry-run`
+to validate inputs and write the four configs without launching workers.
+If launching manually, omit `--peer` and run the same command on both
+nodes with their respective `--node-rank`. With `--peer`, the checkout
+must be at the same path and the output directory shared with node 1.
+
+Each dataset root contains `t2v/` and `ti2v/` Parquet shards created
+with VeOmni's Wan offline embedding workflow for the corresponding
+model. The VAE posterior channel counts differ between the two models.
+In each subdirectory a `lengths.json` can provide token lengths in
+lexicographic shard and row order. When it is omitted, the launcher
+computes lengths from the cached latent shapes before starting the jobs.
+Each model path may be the whole pipeline or the transformer subdirectory
+to benchmark. A pipeline root selects its `transformer/` component. Pass
+the component path explicitly to select `transformer_2/` for a Wan
+checkpoint that has two transformer components. The parent pipeline
+supplies the condition components.
+
+Both data sources use the same transformer weights by default. Use
+`--synthetic-random-init` to skip checkpoint loading for synthetic runs.
+Adjust synthetic geometry with `--synthetic-latent-height`,
+`--synthetic-latent-width`, `--synthetic-context-tokens`, and
+`--synthetic-frame-counts`. The default matrix geometry uses a
+`32 × 32` latent grid and 480 videos with 4, 8, or 16 latent frames.
+By default the pack budget is the longest sequence rounded up for SP,
+the long boundary is half the longest sequence, and the fixed target
+is the longest sequence length squared. The launcher accepts explicit
+`--max-pack-tokens`, `--long-boundary`, and `--fixed-target-runtime`
+overrides. Compare samples per second alongside step time when
+the packing strategies process different numbers of samples.
+
+- E2E time is the maximum rank wall time over a complete measurement window
+  of `DiTTrainer.train_step` calls. It includes data loading, the SP broadcast,
+  forward, backward, optimizer, and scheduler. Warmup, checkpointing,
+  evaluation, and logging callbacks are outside that window.
+- KVF mode also runs a separate instrumented window. CUDA events on the
+  consuming stream bracket each KVF NCCL `Work.wait()`. The script reports
+  the mean and maximum across ranks of the summed waits per step. This
+  estimates exposed stream wait and excludes time already overlapped before
+  the wait, KVF tensor repacking, and FSDP/DP collectives. The rank sums
+  are a diagnostic for individual streams. Switch this pass off with
+  `--benchmark.measure_exposed_wait false`, or enable it in combined mode.
+- Rank zero saves JSON with topology, measured steps, sample count, wall time,
+  and samples per second. Compare samples per second when the modes pack
+  different numbers of videos per step. Set `--benchmark.steps 0` to time a
+  full epoch, and check the sample counts for any tail dropped by either
+  packing policy. Benchmark flags select the window independently of
+  `train.max_steps`.

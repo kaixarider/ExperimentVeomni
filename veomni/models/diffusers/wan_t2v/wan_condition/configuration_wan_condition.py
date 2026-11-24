@@ -60,10 +60,15 @@ class WanTransformer3DConditionModelConfig(VeOmniPretrainedConfig):
         pretrained_model_name_or_path,
         **kwargs,
     ):
-        config_dict, kwargs = super().get_config_dict(pretrained_model_name_or_path, **kwargs)
+        model_index_path = os.path.join(pretrained_model_name_or_path, "model_index.json")
+        config_path = os.path.join(pretrained_model_name_or_path, "config.json")
+        if os.path.isfile(model_index_path) and not os.path.isfile(config_path):
+            # Diffusers snapshots can contain only a pipeline index at the root.
+            config_dict = {}
+        else:
+            config_dict, kwargs = super().get_config_dict(pretrained_model_name_or_path, **kwargs)
         config_dict["base_model_path"] = pretrained_model_name_or_path
 
-        model_index_path = os.path.join(pretrained_model_name_or_path, "model_index.json")
         if os.path.isfile(model_index_path):
             with open(model_index_path, encoding="utf-8") as f:
                 model_index = json.load(f)

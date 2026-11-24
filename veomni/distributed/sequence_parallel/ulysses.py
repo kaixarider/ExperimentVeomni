@@ -13,6 +13,9 @@
 # limitations under the License.
 
 
+from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Optional, Tuple
 
 import torch
@@ -29,6 +32,19 @@ from .utils import (
     pad_tensor,
     unpad_tensor,
 )
+
+
+_ulysses_wait_observer: ContextVar[Callable | None] = ContextVar("ulysses_wait_observer", default=None)
+
+
+@contextmanager
+def observe_ulysses_waits(observer: Callable | None):
+    """Instrument the work waits issued by the KVF Ulysses exchange helper."""
+    token = _ulysses_wait_observer.set(observer)
+    try:
+        yield
+    finally:
+        _ulysses_wait_observer.reset(token)
 
 
 def _all_gather(
@@ -94,7 +110,13 @@ def _all_to_all(
 
 
 def _all_to_all_single(
-    x: Tensor, scatter_dim: int, gather_dim: int, group: Optional[dist.ProcessGroup] = None, async_op: bool = False
+    x: Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    group: Optional[dist.ProcessGroup] = None,
+    async_op: bool = False,
+    *,
+    wait_observer: Callable | None = None,
 ):
     """
     A function to do all-to-all on the first two dim
@@ -122,7 +144,10 @@ def _all_to_all_single(
     if async_op:
 
         def wait():
-            comm.wait()
+            if wait_observer is None:
+                comm.wait()
+            else:
+                wait_observer(comm.wait)
             if scatter_dim == 0:
                 return torch.cat(output.split(x.size(0) // sp_world_size), dim=gather_dim)
             else:
@@ -170,6 +195,17 @@ def all_to_all_tensor(
         return _all_to_all_single(x, scatter_dim, gather_dim, group, async_op)
     else:
         return _all_to_all(x, scatter_dim, gather_dim, group, async_op)
+
+
+@torch.no_grad()
+def start_ulysses_exchange(tensor: Tensor, group: ProcessGroup, *, reverse: bool = False):
+    """Launch an async Ulysses exchange on a [batch, sequence, heads, dim] tensor."""
+    layout = tensor.movedim(0, 2)
+    scatter, gather = (0, 1) if reverse else (1, 0)
+    wait = _all_to_all_single(
+        layout, scatter, gather, group, async_op=True, wait_observer=_ulysses_wait_observer.get()
+    )
+    return lambda: wait().movedim(2, 0)
 
 
 class _SeqAllToAll(torch.autograd.Function):

@@ -49,6 +49,7 @@ class WanTransformer3DModelConfig(VeOmniPretrainedConfig):
         added_kv_proj_dim: Optional[int] = None,
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: Optional[int] = None,
+        kvf_query_blocks: int = 0,
         **kwargs,
     ):
         self.patch_size = patch_size
@@ -67,6 +68,9 @@ class WanTransformer3DModelConfig(VeOmniPretrainedConfig):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.rope_max_seq_len = rope_max_seq_len
         self.pos_embed_seq_len = pos_embed_seq_len
+        if not isinstance(kvf_query_blocks, int) or kvf_query_blocks < 0:
+            raise ValueError("kvf_query_blocks must be a nonnegative integer.")
+        self.kvf_query_blocks = kvf_query_blocks
 
         super().__init__(**kwargs)
 

@@ -256,6 +256,21 @@ ordinary sample-mean scalar losses and per-sample prediction lists, without a
 Trainer packing API; samples may differ in target geometry. See
 `docs/examples/minimax_h3.md` for the model-specific support limits.
 
+### Wan MemDual
+
+`model.model_config.kvf_query_blocks` enables the `attention/ulysses_kvf/nccl`
+row from Wan's video self-attention processor. Wan launches V and K exchange
+as each projection becomes ready and applies RoPE to local Q/K shards. KVF
+uses the current Ulysses group and returns the sequence-sharded output.
+
+`data.anchor_batching` plans synchronized DP rounds from an offline Wan
+mapping dataset's patch-token counts. Each SP leader loads its DP replica's
+packs and the existing DiT step broadcasts them across the SP group.
+Wan calls each FSDP2 transformer block once per pack, dispatches attention
+with per-video boundaries, and restores the outputs per video. DiT weights
+each pack by its sample count divided by the global sample count for the
+optimizer step, adjusted for FSDP2 gradient averaging.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.

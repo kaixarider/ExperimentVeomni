@@ -1,0 +1,55 @@
+# Weight-free smoke test for the complete MemDual benchmark matrix.
+model:
+  config_path: configs/model_configs/wan/wan2.2_i2v_5b.json
+  model_config:
+    num_attention_heads: 8
+    attention_head_dim: 32
+    num_layers: 2
+    in_channels: 4
+    out_channels: 4
+    text_dim: 32
+    freq_dim: 32
+    ffn_dim: 512
+  condition_model_cfg:
+    expand_timesteps: true
+  ops_implementation:
+    attn_implementation: veomni_sdpa
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+  accelerator:
+    init_device: meta
+    ulysses_size: 2
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: bfloat16
+
+data:
+  train_path: synthetic
+  datasets_type: mapping
+  dataloader:
+    num_workers: 0
+    drop_last: true
+    pin_memory: false
+  anchor_batching:
+    lengths_path: ""
+    long_boundary: 256
+    max_pack_tokens: 512
+
+train:
+  global_batch_size: 2
+  micro_batch_size: 1
+  dyn_bsz: false
+  training_task: offline_training
+  checkpoint:
+    output_dir: results/memdual/runargs
+  wandb:
+    enable: false
+
+benchmark:
+  data_source: synthetic
+  fixed_target_runtime: 65536
+  warmup_steps: 1
+  steps: 3
