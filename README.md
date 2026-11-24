@@ -16,6 +16,21 @@
 
 </div>
 
+## MemDual Experiments
+
+Run on node 0 with two 8-GPU nodes, shared paths, and passwordless SSH.
+
+```bash
+python scripts/profile/run_memdual_matrix.py \
+  --t2v-model /shared/models/t2v --ti2v-model /shared/models/ti2v \
+  --datasets /shared/data/set1 /shared/data/set2 /shared/data/set3 \
+  --master-addr "$MASTER_ADDR" --peer user@node1 --out-dir /shared/results/memdual
+```
+
+Each dataset must contain Wan offline Parquet shards under `t2v/` and `ti2v/`.
+The launcher writes 16 JSON results, with 5 warmup and 20 measured steps per run.
+[Details](docs/key_features/ulysses.md#run-both-models-and-both-data-sources)
+
 ## 🍪 Overview
 VeOmni is a versatile framework for both single- and multi-modal pre-training and post-training. It empowers users to seamlessly scale models of any modality across various accelerators, offering both flexibility and user-friendliness.
 
