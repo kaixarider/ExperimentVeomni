@@ -47,6 +47,15 @@ def observe_ulysses_waits(observer: Callable | None):
         _ulysses_wait_observer.reset(token)
 
 
+def wait_ulysses(wait: Callable):
+    """Enqueue a Ulysses wait with optional benchmark instrumentation."""
+    observer = _ulysses_wait_observer.get()
+    if observer is None:
+        wait()
+    else:
+        observer(wait)
+
+
 def _all_gather(
     x: Tensor,
     group: dist.ProcessGroup,

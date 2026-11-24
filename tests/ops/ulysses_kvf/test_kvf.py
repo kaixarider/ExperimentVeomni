@@ -9,15 +9,17 @@ import torch.nn.functional as F
 from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.distributed.sequence_parallel.ulysses import start_ulysses_exchange
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.attention.kvf_nvshmem import close_nvshmem_kvf
+from veomni.utils.import_utils import is_package_available
 
 
-def _check_kvf(rank, store):
+def _check_kvf(rank, store, backend):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group("nccl", init_method=store, rank=rank, world_size=2)
     try:
         group = dist.group.WORLD
-        op = VeomniOp("attention", "ulysses_kvf", "nccl")
+        op = VeomniOp("attention", "ulysses_kvf", backend)
         for batch, length, heads, head_dim, blocks, dtype in (
             (2, 32, 4, 64, 1, torch.bfloat16),
             (2, 29, 4, 64, 3, torch.bfloat16),
@@ -64,6 +66,7 @@ def _check_kvf(rank, store):
                 torch.testing.assert_close(
                     actual_input.grad, padded[:, start : start + shard_size], atol=0.025, rtol=0.04
                 )
+        close_nvshmem_kvf()
     finally:
         dist.destroy_process_group()
 
@@ -73,7 +76,10 @@ def _check_kvf(rank, store):
     torch.version.hip is not None or runner_device_count() < 2 or not dist.is_nccl_available(),
     reason="KVF requires two NCCL-enabled NVIDIA GPUs",
 )
-def test_kvf_output_and_qkv_gradient_parity(tmp_path):
+@pytest.mark.parametrize("backend", ("nccl", "nvshmem"))
+def test_kvf_output_and_qkv_gradient_parity(tmp_path, backend):
+    if backend == "nvshmem" and not all(is_package_available(name) for name in ("nvshmem", "cuda.core")):
+        pytest.skip("Hybrid KVF requires NVSHMEM4Py and CUDA Python.")
     if torch.cuda.device_count() < 2 or any(torch.cuda.get_device_capability(rank)[0] < 8 for rank in range(2)):
         pytest.skip("Requires 2 visible NVIDIA SM80+ GPUs.")
-    mp.spawn(_check_kvf, args=((tmp_path / "nccl").as_uri(),), nprocs=2)
+    mp.spawn(_check_kvf, args=((tmp_path / backend).as_uri(), backend), nprocs=2)

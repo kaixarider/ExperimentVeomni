@@ -1,5 +1,6 @@
 """KV-first query/output pipelining for bidirectional Ulysses attention."""
 
+from functools import partial
 from typing import NamedTuple
 
 import torch
@@ -9,6 +10,7 @@ import torch.nn.functional as F
 from ....distributed.sequence_parallel.ulysses import start_ulysses_exchange
 from ...platform import GpuKernelRequirement, NvidiaGpuPlatform
 from ...registry import register_op
+from .kvf_nvshmem import kvf_block_bytes, prepare_nvshmem_kvf
 
 
 def _process_blocks(blocks, exchange, compute, reverse):
@@ -62,9 +64,10 @@ class _KVF(torch.autograd.Function):
     """Run a row pipeline and save FlashAttention statistics for backward."""
 
     @staticmethod
-    def forward(ctx, query, key, value, key_wait, value_wait, length, blocks, group, scale):
+    def forward(ctx, query, key, value, key_wait, value_wait, length, blocks, group, scale, rows):
         """Exchange query blocks, run attention, and return sequence shards."""
         ctx.group = group
+        ctx.rows = rows
         ctx.scale = scale
         ctx.local_length = query.size(1)
         ctx.blocks = min(blocks, ctx.local_length)
@@ -115,9 +118,9 @@ class _KVF(torch.autograd.Function):
 
         output = _process_blocks(
             query_blocks,
-            lambda x: start_ulysses_exchange(x, group),
+            rows,
             compute,
-            lambda x: start_ulysses_exchange(x, group, reverse=True),
+            partial(rows, reverse=True),
         )
         ctx.flash_sizes = [(state.max_q, state.max_k) for _, state in states]
         ctx.save_for_backward(
@@ -165,9 +168,9 @@ class _KVF(torch.autograd.Function):
 
         dq = _process_blocks(
             grad_output.tensor_split(ctx.blocks, dim=1),
-            lambda x: start_ulysses_exchange(x, group),
+            ctx.rows,
             compute,
-            lambda x: start_ulysses_exchange(x, group, reverse=True),
+            partial(ctx.rows, reverse=True),
         )
         dk_wait = start_ulysses_exchange(
             F.pad(dk.to(key.dtype), (0, 0, 0, ctx.padding)).transpose(1, 2), group, reverse=True
@@ -175,10 +178,10 @@ class _KVF(torch.autograd.Function):
         dv_wait = start_ulysses_exchange(
             F.pad(dv.to(value.dtype), (0, 0, 0, ctx.padding)).transpose(1, 2), group, reverse=True
         )
-        return dq, dk_wait(), dv_wait(), None, None, None, None, None, None
+        return dq, dk_wait(), dv_wait(), None, None, None, None, None, None, None
 
 
-def kvf_attention(query, key, value, *, key_wait, value_wait, length, blocks, group):
+def kvf_attention(query, key, value, *, key_wait, value_wait, length, blocks, group, use_nvshmem=False):
     """Apply bidirectional KVF to matching sequence-sharded [B, S, H, D] inputs."""
     if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
         raise ValueError("Ulysses KVF requires matching Q/K/V shapes [batch, local_sequence, heads, head_dim].")
@@ -192,9 +195,13 @@ def kvf_attention(query, key, value, *, key_wait, value_wait, length, blocks, gr
     if not 0 < head_dim <= 256:
         raise ValueError("The FlashAttention backend for Ulysses KVF supports head dimensions from 1 to 256.")
     scale = head_dim**-0.5
+    rows = partial(start_ulysses_exchange, group=group)
+    if use_nvshmem:
+        block_bytes = kvf_block_bytes(*query.shape, blocks, query.element_size())
+        rows = prepare_nvshmem_kvf(group, query.device, block_bytes).start
     padding = (-head_dim) % 8
     if not padding:
-        return _KVF.apply(query, key, value, key_wait, value_wait, length, blocks, group, scale)
+        return _KVF.apply(query, key, value, key_wait, value_wait, length, blocks, group, scale, rows)
 
     def pad(tensor):
         return F.pad(tensor, (0, padding))
@@ -211,6 +218,7 @@ def kvf_attention(query, key, value, *, key_wait, value_wait, length, blocks, gr
         blocks,
         group,
         scale,
+        rows,
     )
     return output[..., :head_dim]
 
@@ -222,5 +230,16 @@ register_op(
     wrapper=kvf_attention,
     default=True,
     description="KV-first bidirectional Ulysses with pipelined NCCL exchanges and FlashAttention",
+    requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
+)
+
+
+register_op(
+    "attention",
+    "ulysses_kvf",
+    "nvshmem",
+    wrapper=partial(kvf_attention, use_nvshmem=True),
+    description="KV-first Ulysses with NCCL K/V and NVSHMEM Q/O row exchanges",
+    requires=("nvshmem", "cuda.core"),
     requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
 )

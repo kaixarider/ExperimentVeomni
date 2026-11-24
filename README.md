@@ -23,12 +23,22 @@ Run on node 0 with two 8-GPU nodes, shared paths, and passwordless SSH.
 ```bash
 python scripts/profile/run_memdual_matrix.py \
   --t2v-model /shared/models/t2v --ti2v-model /shared/models/ti2v \
-  --datasets /shared/data/set1 /shared/data/set2 /shared/data/set3 \
+  --datasets /shared/meta/panda.csv /shared/meta/webvid.csv /shared/meta/mira.parquet \
   --master-addr "$MASTER_ADDR" --peer user@node1
 ```
 
-Each dataset must contain Wan offline Parquet shards under `t2v/` and `ti2v/`.
-Each run saves a log per node and a metrics JSON under `result/<model>/<data>/`.
+The metadata experiments use clip durations from the three datasets to generate
+Wan latents and text embeddings. Set `--dataset-ratios A:B:C` in dataset order
+to change the default equal mix. Use `--metadata-max-seconds` if the longest
+clips exceed your GPU budget.
+MemDual KVF uses NCCL for K/V and NVSHMEM for the Q/O pipeline. Install a
+matching [NVSHMEM4Py and CUDA runtime](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/nvshmem4py-install-proc.html)
+on both nodes before running the matrix.
+Synthetic KVF pairs each fixed duration with an async-Ulysses baseline. The
+default matrix also runs these pairs with one cross-node Ulysses group at CP 10
+for T2V (5 GPUs per node) and CP 12 for TI2V (6 GPUs per node). Synthetic
+Anchor and Combined use the paper's length bins and share a baseline per ratio.
+Each run saves a log per node and a metrics JSON under `result/<model>/<workload>/`.
 Defaults are 5 warmup and 20 measured steps per run.
 [Details](docs/key_features/ulysses.md#run-both-models-and-both-data-sources)
 

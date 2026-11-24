@@ -258,10 +258,13 @@ Trainer packing API; samples may differ in target geometry. See
 
 ### Wan MemDual
 
-`model.model_config.kvf_query_blocks` enables the `attention/ulysses_kvf/nccl`
-row from Wan's video self-attention processor. Wan launches V and K exchange
-as each projection becomes ready and applies RoPE to local Q/K shards. KVF
-uses the current Ulysses group and returns the sequence-sharded output.
+`model.model_config.kvf_query_blocks` enables Wan video self-attention's
+`attention/ulysses_kvf` variant. Wan launches NCCL V and K exchanges as each
+projection becomes ready and applies RoPE to local Q/K shards. The MemDual
+benchmark selects the `nvshmem` row for Q/O and dO/dQ and keeps dK/dV on NCCL.
+Each Ulysses group has its own NVSHMEM job and each rank reuses symmetric
+slots across layers. The `nccl` row uses NCCL for all exchanges. Both
+implementations return sequence-sharded output.
 
 `data.anchor_batching` plans synchronized DP rounds from an offline Wan
 mapping dataset's patch-token counts. Each SP leader loads its DP replica's

@@ -20,6 +20,12 @@ from veomni.arguments import parse_args
 from veomni.data.diffusion.anchor_batching import AnchorStepSampler
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.sequence_parallel.ulysses import observe_ulysses_waits
+from veomni.ops.kernels.attention.kvf_nvshmem import (
+    close_nvshmem_kvf,
+    kvf_block_bytes,
+    nvshmem_kvf_symmetric_bytes,
+    prepare_nvshmem_kvf,
+)
 from veomni.trainer.base import VeOmniIter
 from veomni.trainer.dit_trainer import DiTModelRuntime, DiTTrainer, VeOmniDiTArguments
 
@@ -42,8 +48,10 @@ class BenchmarkConfig:
     """Select the MemDual ablation and measurement window."""
 
     mode: Literal["baseline", "kvf", "anchor", "combined"] = "combined"
-    data_source: Literal["real", "synthetic"] = "real"
+    data_source: Literal["real", "synthetic", "metadata"] = "real"
     shuffle_real_samples: bool = False
+    real_dataset_mix_path: str = ""
+    metadata_path: str = ""
     synthetic: SyntheticDataConfig = field(default_factory=SyntheticDataConfig)
     reference_attention: Literal["ulysses", "async_ulysses"] = field(
         default="ulysses", metadata={"help": "Attention backend for baseline and anchor modes."}
@@ -72,9 +80,11 @@ def configure_benchmark(args):
     bench = args.benchmark
     if bench.mode not in ("baseline", "kvf", "anchor", "combined"):
         raise ValueError(f"Unknown benchmark mode {bench.mode!r}.")
-    if bench.data_source not in ("real", "synthetic"):
+    if bench.data_source not in ("real", "synthetic", "metadata"):
         raise ValueError(f"Unknown benchmark data source {bench.data_source!r}.")
-    if bench.data_source == "synthetic":
+    if (bench.data_source == "metadata") != bool(bench.metadata_path):
+        raise ValueError("Set benchmark.metadata_path for the metadata data source.")
+    if bench.data_source != "real":
         args.train.training_task = "offline_training"
     if args.train.training_task != "offline_training" or args.data.dataset_name != "mapping":
         raise ValueError("The benchmark requires Wan offline_training with a mapping dataset.")
@@ -106,6 +116,9 @@ def configure_benchmark(args):
         if blocks < 1:
             raise ValueError("KVF requires a positive query block count.")
         args.model.model_config["kvf_query_blocks"] = blocks
+        ops = args.model.ops_implementation
+        if ops.wan_kvf_implementation is None:
+            ops.wan_kvf_implementation = "nvshmem"
     else:
         args.model.model_config["kvf_query_blocks"] = 0
 
@@ -123,8 +136,6 @@ def configure_benchmark(args):
 
 
 def _synthetic_frames(config, seed):
-    if min(config.latent_height, config.latent_width, config.context_tokens) < 1:
-        raise ValueError("Synthetic latent height, width, and context token count must be positive.")
     try:
         pairs = [str(entry).split(":") for entry in config.frame_counts]
         counts = [(int(frames), int(count)) for frames, count in pairs]
@@ -140,8 +151,12 @@ def _synthetic_frames(config, seed):
 class SyntheticWanDataset(Dataset):
     """Generate a deterministic latent posterior and text context per row."""
 
-    def __init__(self, config, model_config, seed, *, expand_timesteps):
-        self.frames = _synthetic_frames(config, seed)
+    def __init__(self, config, model_config, seed, *, expand_timesteps, frames=None):
+        self.frames = _synthetic_frames(config, seed) if frames is None else frames
+        if not self.frames or any(type(count) is not int or count < 1 for count in self.frames):
+            raise ValueError("Generated Wan samples require positive integer latent frame counts.")
+        if min(config.latent_height, config.latent_width, config.context_tokens) < 1:
+            raise ValueError("Synthetic latent height, width, and context token count must be positive.")
         self.height = config.latent_height
         self.width = config.latent_width
         self.context_shape = (1, config.context_tokens, model_config.text_dim)
@@ -251,7 +266,7 @@ class MemDualBenchmarkTrainer(DiTTrainer):
 
     def _build_model_runtime(self):
         args = self.base.args
-        if args.benchmark.data_source == "synthetic":
+        if args.benchmark.data_source != "real":
             return SyntheticWanRuntime(args.model, "base", train=args.train)
         return super()._build_model_runtime()
 
@@ -259,27 +274,46 @@ class MemDualBenchmarkTrainer(DiTTrainer):
         args = self.base.args
         if args.benchmark.data_source == "real":
             super()._load_training_dataset()
-            if args.benchmark.shuffle_real_samples:
-                dataset = self.base.train_dataset
+            dataset = self.base.train_dataset
+            if args.benchmark.real_dataset_mix_path:
+                mix = json.loads(Path(args.benchmark.real_dataset_mix_path).read_text())
+                order = mix.pop("indices")
+                if len(dataset) != sum(mix["available_counts"]):
+                    raise ValueError("Real dataset row count does not match the mix manifest.")
+                self.real_dataset_mix = mix
+                self.base.train_dataset = Subset(dataset, order)
+                args.compute_train_steps(len(order) / args.model.accelerator.dp_size)
+                self.base.train_steps = args.train_steps
+            elif args.benchmark.shuffle_real_samples:
                 order = list(range(len(dataset)))
                 random.Random(args.train.seed).shuffle(order)
                 self.base.train_dataset = Subset(dataset, order)
             return
+        frames = None
+        if args.benchmark.data_source == "metadata":
+            mix = json.loads(Path(args.benchmark.metadata_path).read_text())
+            frames = mix.pop("latent_frames")
+            self.metadata_mix = mix
         model = self.base.model
         self.base.train_dataset = SyntheticWanDataset(
             args.benchmark.synthetic,
             model.model_config,
             args.train.seed,
             expand_timesteps=model.condition_model.config.expand_timesteps,
+            frames=frames,
         )
         args.compute_train_steps(len(self.base.train_dataset) / args.model.accelerator.dp_size)
         self.base.train_steps = args.train_steps
 
     def _load_anchor_lengths(self, config):
-        if self.base.args.benchmark.data_source == "synthetic":
+        if self.base.args.benchmark.data_source != "real":
             return self.base.train_dataset.lengths
         lengths = super()._load_anchor_lengths(config)
-        if self.base.args.benchmark.shuffle_real_samples and isinstance(lengths, list):
+        if (
+            self.base.args.benchmark.shuffle_real_samples
+            and not self.base.args.benchmark.real_dataset_mix_path
+            and isinstance(lengths, list)
+        ):
             dataset = self.base.train_dataset
             if len(lengths) == len(dataset):
                 return [lengths[index] for index in dataset.indices]
@@ -354,6 +388,36 @@ def _benchmark_iterator(trainer):
             iterator.stop()
 
 
+def _kvf_backend(model_args):
+    if model_args.model_config["kvf_query_blocks"]:
+        return getattr(getattr(model_args, "ops_implementation", None), "wan_kvf_implementation", None) or "nccl"
+    return None
+
+
+def _reserve_benchmark_kvf(trainer, bench):
+    """Keep heap allocation outside the timed synthetic and metadata workloads."""
+    args = trainer.base.args.model
+    if _kvf_backend(args) != "nvshmem" or bench.data_source == "real":
+        return
+    if bench.data_source == "metadata":
+        frames = max(json.loads(Path(bench.metadata_path).read_text())["latent_frames"])
+    else:
+        frames = max(int(entry.split(":")[0]) for entry in bench.synthetic.frame_counts)
+    runtime = trainer.base.model
+    config = runtime.model_config
+    parallel = runtime.parallel_state
+    pt, ph, pw = config.patch_size
+    tokens = (frames // pt) * (bench.synthetic.latent_height // ph) * (bench.synthetic.latent_width // pw)
+    block_bytes = kvf_block_bytes(
+        1,
+        math.ceil(tokens / parallel.ulysses_size),
+        config.num_attention_heads,
+        config.attention_head_dim,
+        args.model_config["kvf_query_blocks"],
+    )
+    prepare_nvshmem_kvf(parallel.ulysses_group, torch.device("cuda", torch.cuda.current_device()), block_bytes)
+
+
 def run_benchmark(trainer, bench):
     """Measure an uninstrumented training window and optionally collect KVF waits."""
     total_steps = trainer.base.train_steps
@@ -380,7 +444,15 @@ def run_benchmark(trainer, bench):
     group_root = dist.get_global_rank(parallel.ulysses_group, 0) if parallel.ulysses_enabled else rank
     rank_stats = [None] * dist.get_world_size()
     dist.all_gather_object(
-        rank_stats, (elapsed, trainer.samples, socket.gethostname(), parallel.local_rank, group_root)
+        rank_stats,
+        (
+            elapsed,
+            trainer.samples,
+            socket.gethostname(),
+            parallel.local_rank,
+            group_root,
+            nvshmem_kvf_symmetric_bytes(),
+        ),
     )
     slowest_rank = max(range(len(rank_stats)), key=lambda rank: rank_stats[rank][0])
     seconds = rank_stats[slowest_rank][0]
@@ -390,7 +462,9 @@ def run_benchmark(trainer, bench):
         "data_source": bench.data_source,
         "model_config_path": getattr(trainer.base.args.model, "config_path", None),
         "model_weights_path": getattr(trainer.base.args.model, "model_path", None),
-        "synthetic": asdict(bench.synthetic) if bench.data_source == "synthetic" else None,
+        "synthetic": asdict(bench.synthetic) if bench.data_source != "real" else None,
+        "metadata_mix": getattr(trainer, "metadata_mix", None),
+        "real_dataset_mix": getattr(trainer, "real_dataset_mix", None),
         "packing": "anchor"
         if bench.mode in ("anchor", "combined")
         else "fixed_runtime"
@@ -398,6 +472,8 @@ def run_benchmark(trainer, bench):
         else "fixed_samples",
         "attention": "kvf" if bench.mode in ("kvf", "combined") else bench.reference_attention,
         "kvf_query_blocks": trainer.base.args.model.model_config["kvf_query_blocks"],
+        "kvf_backend": _kvf_backend(trainer.base.args.model),
+        "kvf_symmetric_bytes_per_rank": [stats[5] for stats in rank_stats],
         "dp_size": parallel.dp_size,
         "ulysses_size": parallel.ulysses_size,
         "world_size": len(rank_stats),
@@ -408,7 +484,7 @@ def run_benchmark(trainer, bench):
         "e2e_slowest_rank": slowest_rank,
         "rank_placement": [
             {"rank": rank, "host": host, "local_rank": local_rank, "ulysses_group_root": group}
-            for rank, (_, _, host, local_rank, group) in enumerate(rank_stats)
+            for rank, (_, _, host, local_rank, group, _) in enumerate(rank_stats)
         ],
         "e2e_ms_per_step": 1000 * seconds / steps,
         "samples_per_second": samples / seconds,
@@ -444,7 +520,9 @@ def main():
     try:
         if trainer.base.model.model_config.model_type != "WanTransformer3DModel":
             raise ValueError("The MemDual benchmark requires WanTransformer3DModel.")
+        _reserve_benchmark_kvf(trainer, args.benchmark)
         result = run_benchmark(trainer, args.benchmark)
+        close_nvshmem_kvf()
         if dist.get_rank() == 0:
             payload = json.dumps(result, indent=2)
             print(payload, flush=True)

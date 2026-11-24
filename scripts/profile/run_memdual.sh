@@ -10,7 +10,9 @@ Usage: bash scripts/profile/run_memdual.sh CONFIG.yaml [launcher options] [-- be
   --peer USER@HOST     Start node 1 over passwordless SSH from node 0.
   --node-rank N        Node 0 or 1 when launching separately (or NODE_RANK).
   --nodes N            One or two nodes. Default: 2.
-  --gpus-per-node N    Default: 8. Two-node cross-Ulysses requires an even count.
+  --gpus-per-node N    Default: 8. Two cross-node groups require an even count.
+  --single-cross-node-group
+                       Put all ranks on both nodes in one Ulysses group with DP 1.
   --master-port N      First rendezvous port. Default: 29500 (or MASTER_PORT).
   --modes LIST         Comma-separated modes. Default: baseline,kvf,anchor,combined.
                        Also accepts baseline-sync and anchor-sync.
@@ -42,6 +44,7 @@ cd -- "$script_dir/../.."
 
 nodes=2
 gpus=8
+single_cross_node_group=0
 node_rank=${NODE_RANK:-0}
 master_addr=${MASTER_ADDR:-}
 master_port=${MASTER_PORT:-29500}
@@ -66,6 +69,7 @@ while (($#)); do
             esac
             shift 2
             ;;
+        --single-cross-node-group) single_cross_node_group=1; shift ;;
         --) shift; break ;;
         -h|--help) usage; exit 0 ;;
         *) fail "Unknown launcher option $1. Put training overrides after --." ;;
@@ -82,11 +86,17 @@ overrides=("$@")
 topology=()
 if ((nodes == 2)); then
     [[ -n $master_addr ]] || fail "Set --master-addr to the reachable address of node 0."
-    ((gpus % 2 == 0)) || fail "Cross-node Ulysses requires an even number of GPUs per node."
-    topology=(--model.accelerator.ulysses_size "$gpus" --model.accelerator.cp_size 1
-              --model.accelerator.dp_replicate_size 2 --model.accelerator.dp_shard_size 1)
+    dp_replicas=2
+    if ((single_cross_node_group)); then
+        dp_replicas=1
+    else
+        ((gpus % 2 == 0)) || fail "Two cross-node Ulysses groups require an even GPU count per node."
+    fi
+    topology=(--model.accelerator.ulysses_size "$((nodes * gpus / dp_replicas))" --model.accelerator.cp_size 1
+              --model.accelerator.dp_replicate_size "$dp_replicas" --model.accelerator.dp_shard_size 1)
 else
     [[ -z $peer ]] || fail "--peer requires two nodes."
+    ((single_cross_node_group == 0)) || fail "--single-cross-node-group requires two nodes."
     master_addr=${master_addr:-127.0.0.1}
 fi
 IFS=, read -r -a cases <<< "$modes"
@@ -103,17 +113,21 @@ mkdir -p -- "$out_dir"
 if [[ -n $peer ]]; then
     ((node_rank == 0)) || fail "Use --peer only on node 0."
     # Bash-quote each argument for the SSH login shell.
+    peer_topology=()
+    if ((single_cross_node_group)); then
+        peer_topology=(--single-cross-node-group)
+    fi
     printf -v remote_command '%q ' bash "$script_path" "$config" \
         --master-addr "$master_addr" --master-port "$master_port" --node-rank 1 \
         --nodes "$nodes" --gpus-per-node "$gpus" --modes "$modes" --out-dir "$out_dir" \
-        --python "$python_bin" -- "${overrides[@]}"
+        --python "$python_bin" "${peer_topology[@]}" -- "${overrides[@]}"
     ssh -o BatchMode=yes -- "$peer" "$remote_command" &
     peer_pid=$!
     trap 'kill "$peer_pid" 2>/dev/null || true' EXIT
 fi
 
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-export MEMDUAL_NODES="$nodes"
+export MEMDUAL_REORDER_RANKS=$((nodes == 2 && !single_cross_node_group))
 for index in "${!cases[@]}"; do
     label=${cases[index]}
     mode=${label%-sync}
@@ -127,7 +141,7 @@ for index in "${!cases[@]}"; do
         --rdzv-backend=static --node-rank="$node_rank" --master-addr="$master_addr" \
         --master-port="$((master_port + index))" --rdzv-conf=timeout=90 \
         --no-python /bin/bash -c '
-            if ((MEMDUAL_NODES == 2)); then
+            if ((MEMDUAL_REORDER_RANKS)); then
                 half=$((LOCAL_WORLD_SIZE / 2))
                 export RANK=$(( (LOCAL_RANK / half) * LOCAL_WORLD_SIZE + GROUP_RANK * half + LOCAL_RANK % half ))
             fi

@@ -103,6 +103,7 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "veomni_sage_attention", "cuda", _GPU_NVIDIA_SM80, ("sageattention",)),
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),
     ("attention", "ulysses_kvf", "nccl", "cuda", _GPU_NVIDIA_SM80, ()),
+    ("attention", "ulysses_kvf", "nvshmem", "cuda", _GPU_NVIDIA_SM80, ("nvshmem", "cuda.core")),
     ("dsa_attention", "deepseek_v4", "eager", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
     ("dsa_attention", "deepseek_v4", "triton", "cuda", _GPU_ROCM, ("triton",)),

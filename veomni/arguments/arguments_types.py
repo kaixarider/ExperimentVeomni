@@ -1519,7 +1519,7 @@ class OpsImplementationConfig:
     )
     wan_kvf_implementation: Optional[str] = field(
         default=None,
-        metadata={"help": "Wan KVF implementation when kvf_query_blocks is positive. NCCL is the NVIDIA default."},
+        metadata={"help": "Wan KVF row transport: nccl or nvshmem. Both use NCCL for K/V exchanges."},
     )
     moe_implementation: Optional[str] | OpsSelection = field(
         default=None,

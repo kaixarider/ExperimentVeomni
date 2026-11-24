@@ -412,10 +412,11 @@ Wan's DiT trainer supports two independent opt-in settings from MemDual.
 **KV-first Q-pipeline (KVF)** starts the V exchange before K and Q projection,
 starts K exchange before Q projection, and computes an initial local attention
 partial while communication is in flight. It then pipelines incoming Q blocks
-and outgoing O blocks in forward, and dO and dQ in backward. Communication
-uses NCCL asynchronous all-to-all through the VeOmni Ulysses group. The
-research prototype uses NVSHMEM one-sided transfers, so its published
-communication results apply to that implementation.
+and outgoing O blocks in forward, and dO and dQ in backward. K/V and dK/dV
+use NCCL all-to-all. The MemDual benchmark uses host-issued
+NVSHMEM nonblocking puts with completion signals for Q/O and dO/dQ. It
+reuses four symmetric send/receive slots per Ulysses group across layers
+and both passes. The all-NCCL implementation remains selectable.
 
 **Anchor Batching** groups long and short videos across the data-parallel
 replicas. In a round with a long anchor, the longest sample is assigned
@@ -458,8 +459,9 @@ train:
   NCCL, FP16 or BF16, and an Ulysses degree greater than one that divides
   the number of attention heads. The backend pads head dimensions from 1 to 256
   to FlashAttention alignment while preserving the original softmax scale. It applies to Wan bidirectional video
-  self-attention. The backend defaults to `nccl` and can be selected explicitly
-  through `model.ops_implementation.wan_kvf_implementation`. The configured
+  self-attention. Set `model.ops_implementation.wan_kvf_implementation` to `nvshmem` for the
+  hybrid backend or `nccl` for all-NCCL. The registry default is `nccl`;
+  the MemDual benchmark selects `nvshmem` by default. The configured
   cross-attention backend continues to handle text and image context.
 - Anchor Batching requires Wan offline embeddings, a mapping dataset,
   the native in-order loader with `drop_last: true`, FSDP2, and `cp_size: 1`.
@@ -521,8 +523,31 @@ Use `--benchmark.reference_attention async_ulysses` for the Async Ulysses
 reference. It applies to the `baseline` and `anchor` modes, which use the
 built-in DiT async QKV and output-projection ops with the same Wan model.
 The default `ulysses` selects synchronous Ulysses. The `kvf` and
-`combined` modes use KVF. The JSON `attention` field records the selected
-path.
+`combined` modes use the hybrid backend by default. Install
+[NVSHMEM4Py for the CUDA runtime on the workers](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/nvshmem4py-install-proc.html)
+with host NBI support. Each worker owns one PE and each Ulysses group's
+participating nodes must contribute the same number of ranks. For an
+all-NCCL comparison, pass `--model.ops_implementation.wan_kvf_implementation nccl`
+after the single-run launcher's `--` separator, or use `--kvf-backend nccl`
+with the matrix launcher. For the CUDA 13.0 / NVSHMEM 3.4.5 stack, NVIDIA
+pairs the runtime with `nvshmem4py-cu13==0.1.3` and CUDA Core 0.4.
+Result JSON records `kvf_backend` and
+`kvf_symmetric_bytes_per_rank`.
+
+Each Ulysses group follows the
+[NVSHMEM4Py UID bootstrap example](https://docs.nvidia.com/nvshmem/api/latest/examples/language_bindings/python/index.html#torch-distributed-processgroup-initialization-example).
+Its rank zero creates the UID and broadcasts it to the group before initialization.
+NVSHMEM uses its runtime network configuration. Set any node-specific
+NVSHMEM environment variables on each host when launching via SSH.
+
+For synthetic and metadata runs, the benchmark reserves the symmetric
+payload before warmup using the longest single video in the input, including
+Ulysses and head-dimension padding. Per rank the buffer size is eight times
+the largest rank-local Q block in bytes, plus 64 bytes for signals. Each
+independent video inside a pack uses the same slots. `--benchmark.kvf_query_blocks`
+can reduce the required block size. For very long metadata inputs, set a
+`--metadata-max-seconds` that fits the device budget. Leave headroom for
+NVSHMEM runtime overhead and ordinary training allocations.
 
 The launcher runs the four ablations in sequence with Async Ulysses as
 the reference. With two eight-GPU nodes it sets Ulysses 8 and DP 2,
@@ -575,62 +600,111 @@ frame histogram.
 
 #### Run both models and both data sources
 
-The matrix launcher takes two Wan Diffusers model paths and exactly three
-dataset roots. It pools the three datasets into one real workload per
-model and shuffles rows and their lengths together with a fixed seed.
-For each model and data source it runs `baseline`, `kvf`, `anchor`, and
-`combined`. Logs and metrics go under `result/<model>/<data>/` by default.
-Each experiment writes one `<mode>.json` and a `<mode>.node<N>.log` for each node.
+The matrix launcher takes two Wan Diffusers model paths and metadata from
+three video datasets. It runs the following workloads for each model.
+
+| Workload | Modes | Output directory under `result/<model>/` |
+| --- | --- | --- |
+| Fixed-length synthetic, per duration | `baseline`, `kvf` | `synthetic_fixed/<seconds>s/` |
+| Fixed-length synthetic, larger cross-node CP | `baseline`, `kvf` | `synthetic_fixed_cp<cp>/<seconds>s/` |
+| Trace-derived synthetic, per ratio | `baseline`, `anchor`, `combined` | `synthetic_trace/L<l>_M<m>_S<s>/` |
+| Dataset metadata with generated latents | `baseline`, `kvf`, `anchor`, `combined` | `metadata/` |
+
+The fixed-length pair uses one video per microbatch with async Ulysses
+for the baseline. The trace-derived and metadata baselines use fixed-target
+packing. Each experiment writes one `<mode>.json` and one
+`<mode>.node<N>.log` per node.
 
 ```bash
 python scripts/profile/run_memdual_matrix.py \
     --t2v-model /shared/models/Wan2.2-T2V-A14B-Diffusers \
     --ti2v-model /shared/models/Wan2.2-TI2V-5B-Diffusers \
-    --datasets /shared/data/set1 /shared/data/set2 /shared/data/set3 \
+    --datasets /shared/meta/panda.csv /shared/meta/webvid.csv /shared/meta/mira.parquet \
     --master-addr "$MASTER_ADDR" --peer user@node1
 ```
 
-The command defaults to two nodes with eight GPUs per node, DP 2 and
-Ulysses 8. It uses five warmup steps and 20 measured optimizer steps per
-experiment. The KVF-only mode also measures exposed waits in a separate
+The main matrix defaults to two nodes with eight GPUs per node, DP 2 and
+Ulysses 8. Each eight-rank Ulysses group contains four ranks from each node.
+This layout exposes cross-node all-to-all at CP 8. The additional fixed-length
+KVF pairs test larger CP groups that exceed the eight ranks available on one
+node. T2V uses CP 10 (five ranks per node), and TI2V uses CP 12 (six ranks per
+node). Each additional run uses DP 1, one video per optimizer step, and FSDP2
+within the Ulysses group. Its baseline and KVF run share the same topology and
+inputs. The full default matrix contains 88 runs, including the 16 additional
+fixed-length runs. Use `--skip-extra-kvf-cp` to run the main matrix only.
+Additional pairs are enabled on two-node launches when `--gpus-per-node`
+covers their rank count.
+
+Each run uses five warmup steps and 20 measured optimizer steps. The KVF-only mode also measures exposed waits in a separate
 20-step pass. Adjust the window with `--warmup-steps` and `--steps`.
 For a short run, use `--warmup-steps 1 --steps 3`. Use `--dry-run`
-to validate inputs and write the four configs without launching workers.
+to validate inputs and write the workload configs without launching workers.
 If launching manually, omit `--peer` and run the same command on both
 nodes with their respective `--node-rank`. With `--peer`, the checkout
 must be at the same path and the output directory shared with node 1.
 
-Each dataset root contains `t2v/` and `ti2v/` Parquet shards created
-with VeOmni's Wan offline embedding workflow for the corresponding
-model. The VAE posterior channel counts differ between the two models.
-In each subdirectory a `lengths.json` can provide token lengths in
-lexicographic shard and row order. When it is omitted, the launcher
-computes lengths from the cached latent shapes before starting the jobs.
-Each model path may be the whole pipeline or the transformer subdirectory
-to benchmark. A pipeline root selects its `transformer/` component. Pass
-the component path explicitly to select `transformer_2/` for a Wan
-checkpoint that has two transformer components. The parent pipeline
-supplies the condition components.
+Supply each dataset as a local CSV, CSV.GZ, or Parquet metadata file, or
+a directory of metadata shards. Panda-70M's `timestamp` can contain several
+start/end pairs per row, and each pair contributes one clip. WebVid's
+`duration` accepts numeric seconds and ISO 8601 time durations such as
+`PT1M2.5S`. MiraData uses `seconds`. The launcher reads these fields and
+creates Wan latent shapes from each sampled clip length at 25 FPS.
+The benchmark generates random latent posteriors and text embeddings.
 
-Both data sources use the same transformer weights by default. Use
-`--synthetic-random-init` to skip checkpoint loading for synthetic runs.
-Adjust synthetic geometry with `--synthetic-latent-height`,
-`--synthetic-latent-width`, `--synthetic-context-tokens`, and
-`--synthetic-frame-counts`. The default matrix geometry uses a
-`32 × 32` latent grid and 480 videos with 4, 8, or 16 latent frames.
+The mixture uses `--dataset-ratios A:B:C` in `--datasets` order,
+with `1:1:1` as the default. It samples without replacement up to
+`--metadata-samples` (5,000 clips by default), preserving the ratio.
+Both models use the same sampled video lengths, and all four modes use
+the same ordered latent-frame manifest for their model. The packers
+can change the order and number of samples processed in the measured
+window. Result JSON records the mix, excluded clip counts, and latent-frame
+histogram. The default keeps the duration range supported by both models'
+temporal patch and RoPE limits. Set `--metadata-max-seconds 35`, for example,
+to exclude clips above a duration that fits the test setup. End-to-end
+step time includes latent generation by the data loader.
+
+Each model path may be the whole pipeline or the transformer subdirectory.
+A pipeline root selects its `transformer/` component. Pass
+`transformer_2/` explicitly to benchmark that component on a checkpoint
+with two transformers. By default all workloads use the same transformer
+weights. Use `--synthetic-random-init` to skip checkpoint loading for the
+fixed-length and trace-derived runs.
+
+- Fixed-length workloads use the four durations in MemDual Table 1
+  (14, 21, 28, and 35 seconds), each at 25 FPS. Use `--kvf-seconds 14 21`
+  to run a subset.
+- Trace-derived workloads use the duration boundaries from the paper's
+  three-dataset analysis. Short is below 5 seconds, medium is 5 through
+  20 seconds, and long is above 20 seconds. The launcher samples uniformly
+  over integer video frame counts in each bin at 25 FPS with fixed seeds.
+  It uses the observed 2-second minimum and a configurable 35-second
+  upper cap (`--trace-max-seconds`). The proportions are experimental
+  settings. By default the matrix runs all eight long:medium:short ratios
+  from Figure 12. For example, use `--trace-ratios 1:3:6 1:0:49` to run
+  the two short-heavy mixes.
+- Synthetic workloads use 500 samples by default. If you change
+  `--synthetic-samples`, choose a count divisible by each selected reduced
+  ratio's sum. For all three workloads, the launcher converts video lengths
+  using the model VAE's temporal factor and rounds 1080×1920 down to the VAE and transformer
+  patch grid. Use `--synthetic-latent-height`, `--synthetic-latent-width`,
+  and `--synthetic-context-tokens` to change the generated geometry.
+  Result JSON saves each workload's realized latent-frame histogram.
+
 By default the pack budget is the longest sequence rounded up for SP,
 the long boundary is half the longest sequence, and the fixed target
-is the longest sequence length squared. The launcher accepts explicit
-`--max-pack-tokens`, `--long-boundary`, and `--fixed-target-runtime`
-overrides. Compare samples per second alongside step time when
-the packing strategies process different numbers of samples.
+for trace-derived and metadata workloads is the longest sequence length squared.
+The launcher accepts `--max-pack-tokens`, `--long-boundary`, and
+`--fixed-target-runtime` overrides. Compare samples per second alongside
+step time when the packing strategies process different numbers of videos
+per step.
 
 - E2E time is the maximum rank wall time over a complete measurement window
   of `DiTTrainer.train_step` calls. It includes data loading, the SP broadcast,
   forward, backward, optimizer, and scheduler. Warmup, checkpointing,
   evaluation, and logging callbacks are outside that window.
 - KVF mode also runs a separate instrumented window. CUDA events on the
-  consuming stream bracket each KVF NCCL `Work.wait()`. The script reports
+  consuming stream bracket KVF NCCL work waits and NVSHMEM receive-event waits.
+  The script reports
   the mean and maximum across ranks of the summed waits per step. This
   estimates exposed stream wait and excludes time already overlapped before
   the wait, KVF tensor repacking, and FSDP/DP collectives. The rank sums
