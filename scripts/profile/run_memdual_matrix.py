@@ -47,7 +47,9 @@ def parse_args():
     parser.add_argument("--master-addr", default=os.environ.get("MASTER_ADDR"))
     parser.add_argument("--master-port", type=int, default=int(os.environ.get("MASTER_PORT", 29500)))
     parser.add_argument("--peer", help="Start node 1 via SSH from node 0 with shared model/data/output paths.")
-    parser.add_argument("--out-dir", type=Path, default=Path("results/memdual/matrix"))
+    parser.add_argument(
+        "--out-dir", type=Path, default=ROOT / "result", help="Output directory (default: <repo>/result)."
+    )
     parser.add_argument("--max-pack-tokens", type=int, help="Override the SP-padded token budget for each run.")
     parser.add_argument("--long-boundary", type=int, help="Override the token threshold for singleton anchors.")
     parser.add_argument("--fixed-target-runtime", type=float, help="Override the fixed packing target in L² units.")

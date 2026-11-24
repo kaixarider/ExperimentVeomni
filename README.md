@@ -24,11 +24,12 @@ Run on node 0 with two 8-GPU nodes, shared paths, and passwordless SSH.
 python scripts/profile/run_memdual_matrix.py \
   --t2v-model /shared/models/t2v --ti2v-model /shared/models/ti2v \
   --datasets /shared/data/set1 /shared/data/set2 /shared/data/set3 \
-  --master-addr "$MASTER_ADDR" --peer user@node1 --out-dir /shared/results/memdual
+  --master-addr "$MASTER_ADDR" --peer user@node1
 ```
 
 Each dataset must contain Wan offline Parquet shards under `t2v/` and `ti2v/`.
-The launcher writes 16 JSON results, with 5 warmup and 20 measured steps per run.
+Each run saves a log per node and a metrics JSON under `result/<model>/<data>/`.
+Defaults are 5 warmup and 20 measured steps per run.
 [Details](docs/key_features/ulysses.md#run-both-models-and-both-data-sources)
 
 ## 🍪 Overview

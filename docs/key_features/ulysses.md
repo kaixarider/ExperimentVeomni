@@ -539,7 +539,8 @@ bash scripts/profile/run_memdual.sh "$CONFIG" \
 Without SSH, omit `--peer` and run the command on both nodes with
 `--node-rank 0` and `--node-rank 1`, respectively.
 Use `--modes baseline-sync` for a separate synchronous baseline.
-The launcher writes JSON under `results/memdual/` by default.
+The launcher writes a log per node and a metrics JSON per mode under
+`result/single/` by default.
 Training and benchmark overrides go after `--`.
 Use `--benchmark.fixed_target_runtime` there for a fixed-runtime packing
 reference. Run `bash scripts/profile/run_memdual.sh --help` for the full
@@ -550,7 +551,7 @@ latents and text embeddings and randomly initialized Wan weights, run
 
 ```bash
 bash scripts/profile/run_memdual.sh configs/dit/wan_memdual_synthetic.yaml \
-    --nodes 1 --gpus-per-node 4 --out-dir results/memdual/synthetic
+    --nodes 1 --gpus-per-node 4 --out-dir result/synthetic
 ```
 
 The synthetic config starts with a two-layer model. To measure at the full
@@ -568,7 +569,7 @@ the requested warmup and measurement steps.
 
 For a real-data run, use a separate offline-training YAML pointing to
 cached Wan embeddings and the matching token-length JSON. Set the output
-directory to a separate path such as `results/memdual/real`. Each result
+directory to a separate path such as `result/real`. Each result
 records its `data_source` and, for synthetic runs, the input geometry and
 frame histogram.
 
@@ -578,15 +579,15 @@ The matrix launcher takes two Wan Diffusers model paths and exactly three
 dataset roots. It pools the three datasets into one real workload per
 model and shuffles rows and their lengths together with a fixed seed.
 For each model and data source it runs `baseline`, `kvf`, `anchor`, and
-`combined`, producing 16 JSON files in total.
+`combined`. Logs and metrics go under `result/<model>/<data>/` by default.
+Each experiment writes one `<mode>.json` and a `<mode>.node<N>.log` for each node.
 
 ```bash
 python scripts/profile/run_memdual_matrix.py \
     --t2v-model /shared/models/Wan2.2-T2V-A14B-Diffusers \
     --ti2v-model /shared/models/Wan2.2-TI2V-5B-Diffusers \
     --datasets /shared/data/set1 /shared/data/set2 /shared/data/set3 \
-    --master-addr "$MASTER_ADDR" --peer user@node1 \
-    --out-dir /shared/results/memdual
+    --master-addr "$MASTER_ADDR" --peer user@node1
 ```
 
 The command defaults to two nodes with eight GPUs per node, DP 2 and

@@ -14,7 +14,7 @@ Usage: bash scripts/profile/run_memdual.sh CONFIG.yaml [launcher options] [-- be
   --master-port N      First rendezvous port. Default: 29500 (or MASTER_PORT).
   --modes LIST         Comma-separated modes. Default: baseline,kvf,anchor,combined.
                        Also accepts baseline-sync and anchor-sync.
-  --out-dir DIR        Default: results/memdual, relative to the checkout.
+  --out-dir DIR        Logs and JSON results. Default: result/single in the checkout.
   --python PATH        Python executable in the training environment on both nodes.
   -h, --help           Show this help.
 
@@ -46,7 +46,7 @@ node_rank=${NODE_RANK:-0}
 master_addr=${MASTER_ADDR:-}
 master_port=${MASTER_PORT:-29500}
 modes=baseline,kvf,anchor,combined
-out_dir=results/memdual
+out_dir=result/single
 python_bin=$(command -v python || true)
 peer=
 while (($#)); do
@@ -98,6 +98,8 @@ for mode in "${cases[@]}"; do
     esac
 done
 
+mkdir -p -- "$out_dir"
+
 if [[ -n $peer ]]; then
     ((node_rank == 0)) || fail "Use --peer only on node 0."
     # Bash-quote each argument for the SSH login shell.
@@ -133,7 +135,7 @@ for index in "${!cases[@]}"; do
         ' _ "$python_bin" scripts/profile/benchmark_memdual.py "$config" \
         --benchmark.mode "$mode" --benchmark.reference_attention "$reference" \
         --benchmark.output "$out_dir/$label.json" --train.checkpoint.output_dir "$out_dir/runargs/$label" \
-        "${topology[@]}" "${overrides[@]}"
+        "${topology[@]}" "${overrides[@]}" 2>&1 | tee -- "$out_dir/$label.node$node_rank.log"
 done
 
 if [[ -n $peer ]]; then

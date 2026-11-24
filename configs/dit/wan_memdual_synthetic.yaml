@@ -44,7 +44,7 @@ train:
   dyn_bsz: false
   training_task: offline_training
   checkpoint:
-    output_dir: results/memdual/runargs
+    output_dir: result/single/runargs
   wandb:
     enable: false
 
