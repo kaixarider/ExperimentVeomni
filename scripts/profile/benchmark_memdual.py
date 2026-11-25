@@ -62,6 +62,9 @@ class BenchmarkConfig:
     fixed_target_runtime: Optional[float] = field(
         default=None, metadata={"help": "Enable fixed-runtime packing for baseline and KVF modes."}
     )
+    fixed_target_runtime_ms: Optional[int] = field(
+        default=None, metadata={"help": "H800 peak-compute runtime budget used to derive the fixed packing target."}
+    )
     measure_exposed_wait: Optional[bool] = field(
         default=None, metadata={"help": "Run a separate wait measurement. Enabled by default for kvf mode."}
     )
@@ -125,6 +128,8 @@ def configure_benchmark(args):
     fixed_target = bench.fixed_target_runtime
     if fixed_target is not None and (not math.isfinite(fixed_target) or fixed_target <= 0):
         raise ValueError("Fixed runtime target must be finite and positive.")
+    if bench.fixed_target_runtime_ms is not None and (fixed_target is None or bench.fixed_target_runtime_ms <= 0):
+        raise ValueError("A millisecond runtime budget requires a positive fixed packing target.")
     if with_anchor or fixed_target is not None:
         if args.data.anchor_batching is None:
             raise ValueError("Anchor or fixed-target packing needs data.anchor_batching calibration.")
@@ -458,6 +463,7 @@ def run_benchmark(trainer, bench):
     seconds = rank_stats[slowest_rank][0]
     samples = sum(row[1] for row in rank_stats)
     kvf_backend = _kvf_backend(trainer.base.args.model)
+    uses_anchor = bench.mode in ("anchor", "combined")
     result = {
         "mode": bench.mode,
         "data_source": bench.data_source,
@@ -467,10 +473,12 @@ def run_benchmark(trainer, bench):
         "metadata_mix": getattr(trainer, "metadata_mix", None),
         "real_dataset_mix": getattr(trainer, "real_dataset_mix", None),
         "packing": "anchor"
-        if bench.mode in ("anchor", "combined")
+        if uses_anchor
         else "fixed_runtime"
         if bench.fixed_target_runtime is not None
         else "fixed_samples",
+        "fixed_target_runtime": bench.fixed_target_runtime if not uses_anchor else None,
+        "fixed_target_runtime_ms": bench.fixed_target_runtime_ms if not uses_anchor else None,
         "attention": "kvf" if bench.mode in ("kvf", "combined") else bench.reference_attention,
         "kvf_query_blocks": trainer.base.args.model.model_config["kvf_query_blocks"],
         "kvf_backend": kvf_backend,

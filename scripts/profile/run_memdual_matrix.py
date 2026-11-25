@@ -17,9 +17,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-METADATA_MODES = ("baseline", "kvf", "anchor", "combined")
 FIXED_MODES = ("baseline", "kvf")
-TRACE_MODES = ("baseline", "anchor", "combined")
+ANCHOR_MODES = ("anchor", "combined")
+FIXED_TARGET_MS = (50_000, 100_000, 150_000, 200_000)
+H800_SXM_DENSE_BF16_FLOPS_PER_SECOND = 989.5e12
 KVF_SECONDS = (14, 21, 28, 35)
 EXTRA_KVF_CP = {"t2v": 10, "ti2v": 12}
 TRACE_RATIOS = ((1, 0, 49), (1, 3, 6), (1, 49, 50), (1, 6, 3), (3, 1, 6), (3, 6, 1), (6, 1, 3), (6, 3, 1))
@@ -38,6 +39,8 @@ class WanModel:
     vae_temporal_factor: int
     vae_spatial_factor: int
     rope_max_seq_len: int
+    hidden_size: int
+    num_layers: int
 
 
 def parse_ratio(value):
@@ -80,7 +83,11 @@ def parse_args():
     )
     parser.add_argument("--max-pack-tokens", type=int, help="Override the SP-padded token budget for each run.")
     parser.add_argument("--long-boundary", type=int, help="Override the token threshold for singleton anchors.")
-    parser.add_argument("--fixed-target-runtime", type=float, help="Override the fixed packing target in L² units.")
+    parser.add_argument(
+        "--fixed-target-runtime",
+        type=float,
+        help="Use one packing target in L² units instead of the 50/100/150/200-second H800 sweep.",
+    )
     parser.add_argument(
         "--dataset-ratios",
         type=parse_ratio,
@@ -167,6 +174,10 @@ def parse_args():
         parser.error("--metadata-max-seconds must be finite and positive.")
     if args.trace_max_seconds <= 20:
         parser.error("--trace-max-seconds must be greater than 20.")
+    if args.fixed_target_runtime is not None and (
+        not math.isfinite(args.fixed_target_runtime) or args.fixed_target_runtime <= 0
+    ):
+        parser.error("--fixed-target-runtime must be finite and positive.")
     args.trace_ratios = list(dict.fromkeys(args.trace_ratios))
     if args.synthetic_samples < 1 or any(args.synthetic_samples % sum(ratio) for ratio in args.trace_ratios):
         parser.error("--synthetic-samples must be a positive multiple of each reduced trace ratio total.")
@@ -175,9 +186,10 @@ def parse_args():
         for kind, cp_size in EXTRA_KVF_CP.items()
         if args.nodes == 2 and not args.skip_extra_kvf_cp and cp_size // 2 <= args.gpus_per_node
     }
-    runs = 2 * (
-        len(METADATA_MODES) + len(TRACE_MODES) * len(args.trace_ratios) + len(FIXED_MODES) * len(args.kvf_seconds)
-    ) + len(args.extra_kvf_cp) * len(FIXED_MODES) * len(args.kvf_seconds)
+    baseline_runs = len(FIXED_TARGET_MS) if args.fixed_target_runtime is None else 1
+    packing_runs = (1 + len(args.trace_ratios)) * (baseline_runs + len(ANCHOR_MODES)) + 1
+    fixed_runs = len(FIXED_MODES) * len(args.kvf_seconds)
+    runs = 2 * packing_runs + (2 + len(args.extra_kvf_cp)) * fixed_runs
     if not 0 <= args.node_rank < args.nodes or not 1 <= args.master_port <= 65536 - runs:
         parser.error(f"Invalid node rank or base port for {runs} consecutive rendezvous ports.")
     if args.gpus_per_node % 2 or args.gpus_per_node < (4 if args.nodes == 1 else 2):
@@ -216,6 +228,8 @@ def load_model(kind, path, ulysses_size, extra_ulysses_size=None):
         vae.get("scale_factor_temporal", 4),
         vae.get("scale_factor_spatial", 8 if kind == "t2v" else 16),
         config.get("rope_max_seq_len", 1024),
+        config["num_attention_heads"] * config["attention_head_dim"],
+        config["num_layers"],
     )
 
 
@@ -394,7 +408,19 @@ def synthetic_workload(args, model, *, seconds, trace_ratio, metadata_frames):
     }, (max(counts) // pt) * (height // ph) * (width // pw)
 
 
-def write_config(args, model, workload, ulysses_size, *, dp_replicas=2, metadata=None, seconds=None, trace_ratio=None):
+def write_config(
+    args,
+    model,
+    workload,
+    ulysses_size,
+    *,
+    dp_replicas=2,
+    metadata=None,
+    seconds=None,
+    trace_ratio=None,
+    fixed_target=None,
+    fixed_target_ms=None,
+):
     directory = args.out_dir / model.kind / workload
     directory.mkdir(parents=True, exist_ok=True)
     metadata_path = ""
@@ -411,10 +437,7 @@ def write_config(args, model, workload, ulysses_size, *, dp_replicas=2, metadata
     padded_longest = math.ceil(longest / ulysses_size) * ulysses_size
     budget = args.max_pack_tokens if args.max_pack_tokens is not None else padded_longest
     boundary = args.long_boundary if args.long_boundary is not None else math.ceil(longest / 2)
-    target = None
-    if seconds is None:
-        target = args.fixed_target_runtime if args.fixed_target_runtime is not None else longest**2
-    if budget < padded_longest or boundary < 1 or (target is not None and (not math.isfinite(target) or target <= 0)):
+    if budget < padded_longest or boundary < 1:
         raise ValueError(
             f"{model.kind}/{workload} needs a pack budget ≥ {padded_longest} and positive packing settings."
         )
@@ -424,7 +447,8 @@ def write_config(args, model, workload, ulysses_size, *, dp_replicas=2, metadata
         "synthetic": synthetic,
         "warmup_steps": args.warmup_steps,
         "steps": args.steps,
-        "fixed_target_runtime": target,
+        "fixed_target_runtime": fixed_target,
+        "fixed_target_runtime_ms": fixed_target_ms,
     }
     config = {
         "model": {
@@ -474,6 +498,33 @@ def write_config(args, model, workload, ulysses_size, *, dp_replicas=2, metadata
     return config_path
 
 
+def packing_configs(args, model, workload, ulysses_size, *, metadata=None, trace_ratio=None):
+    if args.fixed_target_runtime is None:
+        # QK^T and PV cost 4 * layers * hidden_size * L² in forward.
+        # Estimate forward and backward as 3x forward at the CP group's dense peak.
+        flops_per_l2 = 12 * model.num_layers * model.hidden_size
+        l2_per_ms = H800_SXM_DENSE_BF16_FLOPS_PER_SECOND * ulysses_size / (1000 * flops_per_l2)
+        targets = [(f"{ms}ms", ms * l2_per_ms, ms) for ms in FIXED_TARGET_MS]
+    else:
+        targets = [("custom", args.fixed_target_runtime, None)]
+    for index, (label, target, target_ms) in enumerate(targets):
+        config = write_config(
+            args,
+            model,
+            f"{workload}/fixed_target/{label}",
+            ulysses_size,
+            metadata=metadata,
+            trace_ratio=trace_ratio,
+            fixed_target=target,
+            fixed_target_ms=target_ms,
+        )
+        # KVF-only and its paired Async Ulysses baseline use the same packs.
+        modes = FIXED_MODES if index == 0 and metadata is not None else ("baseline",)
+        yield config, modes, ulysses_size, 2
+    anchor = write_config(args, model, workload, ulysses_size, metadata=metadata, trace_ratio=trace_ratio)
+    yield anchor, ANCHOR_MODES, ulysses_size, 2
+
+
 def main():
     args = parse_args()
     args.out_dir = args.out_dir.resolve()
@@ -508,16 +559,14 @@ def main():
     )
     configs = []
     for model in models:
-        measured = write_config(args, model, "metadata", ulysses_size, metadata=(raw_frames, mix))
-        configs.append((measured, METADATA_MODES, ulysses_size, 2))
+        configs.extend(packing_configs(args, model, "metadata", ulysses_size, metadata=(raw_frames, mix)))
         for seconds in args.kvf_seconds:
             fixed = write_config(args, model, f"synthetic_fixed/{seconds}s", ulysses_size, seconds=seconds)
             configs.append((fixed, FIXED_MODES, ulysses_size, 2))
         for ratio in args.trace_ratios:
             long, medium, short = ratio
             workload = f"synthetic_trace/L{long}_M{medium}_S{short}"
-            trace = write_config(args, model, workload, ulysses_size, trace_ratio=ratio)
-            configs.append((trace, TRACE_MODES, ulysses_size, 2))
+            configs.extend(packing_configs(args, model, workload, ulysses_size, trace_ratio=ratio))
 
     for model in models:
         if model.kind not in args.extra_kvf_cp:

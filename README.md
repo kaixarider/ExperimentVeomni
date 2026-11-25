@@ -37,8 +37,8 @@ on both nodes before running the matrix.
 The NVSHMEM heap defaults to `6G` per GPU. Use `--nvshmem-symmetric-size 8G` to override it.
 Synthetic KVF pairs each fixed duration with an async-Ulysses baseline. The
 default matrix also runs these pairs with one cross-node Ulysses group at CP 10
-for T2V (5 GPUs per node) and CP 12 for TI2V (6 GPUs per node). Synthetic
-Anchor and Combined use the paper's length bins and share a baseline per ratio.
+for T2V (5 GPUs per node) and CP 12 for TI2V (6 GPUs per node).
+Metadata and trace baselines sweep H800-estimated pack budgets of 50, 100, 150, and 200 seconds.
 Each run saves a log per node and a metrics JSON under `result/<model>/<workload>/`.
 Defaults are 5 warmup and 20 measured steps per run.
 [Details](docs/key_features/ulysses.md#run-both-models-and-both-data-sources)

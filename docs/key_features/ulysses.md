@@ -610,13 +610,14 @@ three video datasets. It runs the following workloads for each model.
 | --- | --- | --- |
 | Fixed-length synthetic, per duration | `baseline`, `kvf` | `synthetic_fixed/<seconds>s/` |
 | Fixed-length synthetic, larger cross-node CP | `baseline`, `kvf` | `synthetic_fixed_cp<cp>/<seconds>s/` |
-| Trace-derived synthetic, per ratio | `baseline`, `anchor`, `combined` | `synthetic_trace/L<l>_M<m>_S<s>/` |
-| Dataset metadata with generated latents | `baseline`, `kvf`, `anchor`, `combined` | `metadata/` |
+| Trace-derived synthetic, per ratio | `anchor`, `combined`, four `baseline` runs | `synthetic_trace/L<l>_M<m>_S<s>/` |
+| Dataset metadata with generated latents | `anchor`, `combined`, `kvf`, four `baseline` runs | `metadata/` |
 
 The fixed-length pair uses one video per microbatch with async Ulysses
 for the baseline. The trace-derived and metadata baselines use fixed-target
-packing. Each experiment writes one `<mode>.json` and one
-`<mode>.node<N>.log` per node.
+packing and write each budget under `fixed_target/<budget>ms/` within its
+workload. Metadata KVF uses the same packs as the 50,000 ms baseline.
+Each experiment writes one `<mode>.json` and a `<mode>.node<N>.log` for each node.
 
 ```bash
 python scripts/profile/run_memdual_matrix.py \
@@ -633,7 +634,7 @@ KVF pairs test larger CP groups that exceed the eight ranks available on one
 node. T2V uses CP 10 (five ranks per node), and TI2V uses CP 12 (six ranks per
 node). Each additional run uses DP 1, one video per optimizer step, and FSDP2
 within the Ulysses group. Its baseline and KVF run share the same topology and
-inputs. The full default matrix contains 88 runs, including the 16 additional
+inputs. The full default matrix contains 142 runs, including the 16 additional
 fixed-length runs. Use `--skip-extra-kvf-cp` to run the main matrix only.
 Additional pairs are enabled on two-node launches when `--gpus-per-node`
 covers their rank count.
@@ -696,11 +697,16 @@ fixed-length and trace-derived runs.
 By default the pack token budget is the longest sequence rounded up
 for SP, and the long boundary is half the longest sequence. For
 metadata and trace-derived workloads, fixed-target packing sums each
-sample's unpadded token length squared and uses the longest sample's
-length squared as the target. Each workload uses one target. An
-individual sample above the target runs alone. The fixed-duration KVF
-pairs use fixed sample counts. The launcher accepts `--max-pack-tokens`,
-`--long-boundary`, and `--fixed-target-runtime` overrides. Compare
+sample's unpadded token length squared. Each workload sweeps 50,000,
+100,000, 150,000, and 200,000 ms of estimated compute time. The
+launcher converts each budget to an L² target using the CP group's
+H800 SXM dense BF16 peak (989.5 TFLOP/s per GPU) and estimates the
+self-attention forward and backward matmuls as
+`12 × num_layers × hidden_size × L²` FLOPs per sample.
+An individual sample above the target runs alone. The fixed-duration
+KVF pairs use fixed sample counts. Use `--fixed-target-runtime` to run
+one custom L² target. The result JSON records `fixed_target_runtime`
+and `fixed_target_runtime_ms` for the fixed-target runs. Compare
 samples per second alongside step time when the packing strategies
 process different numbers of videos per step.
 
