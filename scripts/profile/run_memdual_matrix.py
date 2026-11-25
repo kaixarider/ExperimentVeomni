@@ -187,7 +187,7 @@ def parse_args():
         if args.nodes == 2 and not args.skip_extra_kvf_cp and cp_size // 2 <= args.gpus_per_node
     }
     baseline_runs = len(FIXED_TARGET_MS) if args.fixed_target_runtime is None else 1
-    packing_runs = (1 + len(args.trace_ratios)) * (baseline_runs + len(ANCHOR_MODES)) + 1
+    packing_runs = (1 + len(args.trace_ratios)) * (baseline_runs + len(ANCHOR_MODES)) + len(FIXED_MODES)
     fixed_runs = len(FIXED_MODES) * len(args.kvf_seconds)
     runs = 2 * packing_runs + (2 + len(args.extra_kvf_cp)) * fixed_runs
     if not 0 <= args.node_rank < args.nodes or not 1 <= args.master_port <= 65536 - runs:
@@ -507,7 +507,7 @@ def packing_configs(args, model, workload, ulysses_size, *, metadata=None, trace
         targets = [(f"{ms}ms", ms * l2_per_ms, ms) for ms in FIXED_TARGET_MS]
     else:
         targets = [("custom", args.fixed_target_runtime, None)]
-    for index, (label, target, target_ms) in enumerate(targets):
+    for label, target, target_ms in targets:
         config = write_config(
             args,
             model,
@@ -518,11 +518,11 @@ def packing_configs(args, model, workload, ulysses_size, *, metadata=None, trace
             fixed_target=target,
             fixed_target_ms=target_ms,
         )
-        # KVF-only and its paired Async Ulysses baseline use the same packs.
-        modes = FIXED_MODES if index == 0 and metadata is not None else ("baseline",)
-        yield config, modes, ulysses_size, 2
-    anchor = write_config(args, model, workload, ulysses_size, metadata=metadata, trace_ratio=trace_ratio)
-    yield anchor, ANCHOR_MODES, ulysses_size, 2
+        yield config, ("baseline",), ulysses_size, 2
+    config = write_config(args, model, workload, ulysses_size, metadata=metadata, trace_ratio=trace_ratio)
+    # Metadata also has a KVF-only comparison with fixed-size microbatches.
+    modes = (*FIXED_MODES, *ANCHOR_MODES) if metadata is not None else ANCHOR_MODES
+    yield config, modes, ulysses_size, 2
 
 
 def main():

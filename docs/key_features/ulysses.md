@@ -611,12 +611,14 @@ three video datasets. It runs the following workloads for each model.
 | Fixed-length synthetic, per duration | `baseline`, `kvf` | `synthetic_fixed/<seconds>s/` |
 | Fixed-length synthetic, larger cross-node CP | `baseline`, `kvf` | `synthetic_fixed_cp<cp>/<seconds>s/` |
 | Trace-derived synthetic, per ratio | `anchor`, `combined`, four `baseline` runs | `synthetic_trace/L<l>_M<m>_S<s>/` |
-| Dataset metadata with generated latents | `anchor`, `combined`, `kvf`, four `baseline` runs | `metadata/` |
+| Dataset metadata with generated latents | `baseline`, `kvf`, `anchor`, `combined`, four fixed-target `baseline` runs | `metadata/` |
 
 The fixed-length pair uses one video per microbatch with async Ulysses
-for the baseline. The trace-derived and metadata baselines use fixed-target
-packing and write each budget under `fixed_target/<budget>ms/` within its
-workload. Metadata KVF uses the same packs as the 50,000 ms baseline.
+for the baseline. The metadata KVF-only comparison also uses one video
+per microbatch for both KVF and its Async Ulysses baseline. The
+Anchor Batching baselines for metadata and trace-derived workloads
+use fixed-target packing and write each budget under
+`fixed_target/<budget>ms/` within its workload.
 Each experiment writes one `<mode>.json` and a `<mode>.node<N>.log` for each node.
 
 ```bash
@@ -634,7 +636,7 @@ KVF pairs test larger CP groups that exceed the eight ranks available on one
 node. T2V uses CP 10 (five ranks per node), and TI2V uses CP 12 (six ranks per
 node). Each additional run uses DP 1, one video per optimizer step, and FSDP2
 within the Ulysses group. Its baseline and KVF run share the same topology and
-inputs. The full default matrix contains 142 runs, including the 16 additional
+inputs. The full default matrix contains 144 runs, including the 16 additional
 fixed-length runs. Use `--skip-extra-kvf-cp` to run the main matrix only.
 Additional pairs are enabled on two-node launches when `--gpus-per-node`
 covers their rank count.
