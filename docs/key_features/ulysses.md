@@ -615,10 +615,11 @@ three video datasets. It runs the following workloads for each model.
 
 The fixed-length pair uses one video per microbatch with async Ulysses
 for the baseline. The metadata KVF-only comparison also uses one video
-per microbatch for both KVF and its Async Ulysses baseline. The
-Anchor Batching baselines for metadata and trace-derived workloads
-use fixed-target packing and write each budget under
-`fixed_target/<budget>ms/` within its workload.
+per microbatch for both KVF and its Async Ulysses baseline.
+For metadata and trace-derived workloads, `anchor` (Anchor Batching +
+Async Ulysses) and `combined` (Anchor Batching + KVF) share the same
+four fixed-pack + Async Ulysses baselines. Each budget is run once
+per workload and saved under `fixed_target/<budget>ms/`.
 Each experiment writes one `<mode>.json` and a `<mode>.node<N>.log` for each node.
 
 ```bash
