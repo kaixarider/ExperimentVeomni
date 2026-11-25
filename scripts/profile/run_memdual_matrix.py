@@ -106,6 +106,11 @@ def parse_args():
         help="Use hybrid NVSHMEM row exchanges or the all-NCCL KVF comparison.",
     )
     parser.add_argument(
+        "--nvshmem-symmetric-size",
+        metavar="SIZE",
+        help="NVSHMEM heap per GPU (default: NVSHMEM_SYMMETRIC_SIZE or 6G).",
+    )
+    parser.add_argument(
         "--kvf-seconds",
         type=int,
         nargs="+",
@@ -560,6 +565,8 @@ def main():
             command.append("--single-cross-node-group")
         if args.master_addr:
             command.extend(("--master-addr", args.master_addr))
+        if args.nvshmem_symmetric_size is not None:
+            command.extend(("--nvshmem-symmetric-size", args.nvshmem_symmetric_size))
         if args.peer:
             command.extend(("--peer", args.peer))
         subprocess.run(command, check=True, cwd=ROOT)

@@ -531,14 +531,17 @@ all-NCCL comparison, pass `--model.ops_implementation.wan_kvf_implementation ncc
 after the single-run launcher's `--` separator, or use `--kvf-backend nccl`
 with the matrix launcher. For the CUDA 13.0 / NVSHMEM 3.4.5 stack, NVIDIA
 pairs the runtime with `nvshmem4py-cu13==0.1.3` and CUDA Core 0.4.
-Result JSON records `kvf_backend` and
-`kvf_symmetric_bytes_per_rank`.
+Result JSON records `kvf_backend`, the requested `nvshmem_symmetric_size`,
+and `kvf_symmetric_bytes_per_rank`.
 
 Each Ulysses group follows the
 [NVSHMEM4Py UID bootstrap example](https://docs.nvidia.com/nvshmem/api/latest/examples/language_bindings/python/index.html#torch-distributed-processgroup-initialization-example).
 Its rank zero creates the UID and broadcasts it to the group before initialization.
-NVSHMEM uses its runtime network configuration. Set any node-specific
-NVSHMEM environment variables on each host when launching via SSH.
+Both launchers set `NVSHMEM_SYMMETRIC_SIZE` to `6G` per GPU by default.
+Override it with the environment variable or `--nvshmem-symmetric-size 8G`.
+The flag takes precedence. The SSH launcher sends the same value to the
+peer. For manual launches, pass the same size on both nodes.
+Set node-specific NVSHMEM network variables on each host.
 
 For synthetic and metadata runs, the benchmark reserves the symmetric
 payload before warmup using the longest single video in the input, including

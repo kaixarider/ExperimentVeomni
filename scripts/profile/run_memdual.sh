@@ -16,6 +16,8 @@ Usage: bash scripts/profile/run_memdual.sh CONFIG.yaml [launcher options] [-- be
   --master-port N      First rendezvous port. Default: 29500 (or MASTER_PORT).
   --modes LIST         Comma-separated modes. Default: baseline,kvf,anchor,combined.
                        Also accepts baseline-sync and anchor-sync.
+  --nvshmem-symmetric-size SIZE
+                       Heap per GPU. Default: NVSHMEM_SYMMETRIC_SIZE or 6G.
   --out-dir DIR        Logs and JSON results. Default: result/single in the checkout.
   --python PATH        Python executable in the training environment on both nodes.
   -h, --help           Show this help.
@@ -49,12 +51,13 @@ node_rank=${NODE_RANK:-0}
 master_addr=${MASTER_ADDR:-}
 master_port=${MASTER_PORT:-29500}
 modes=baseline,kvf,anchor,combined
+nvshmem_symmetric_size=${NVSHMEM_SYMMETRIC_SIZE:-6G}
 out_dir=result/single
 python_bin=$(command -v python || true)
 peer=
 while (($#)); do
     case "$1" in
-        --master-addr|--peer|--node-rank|--nodes|--gpus-per-node|--master-port|--modes|--out-dir|--python)
+        --master-addr|--peer|--node-rank|--nodes|--gpus-per-node|--master-port|--modes|--out-dir|--python|--nvshmem-symmetric-size)
             [[ $# -ge 2 && -n $2 ]] || fail "Missing value for $1."
             case "$1" in
                 --master-addr) master_addr=$2 ;;
@@ -64,6 +67,7 @@ while (($#)); do
                 --gpus-per-node) gpus=$2 ;;
                 --master-port) master_port=$2 ;;
                 --modes) modes=$2 ;;
+                --nvshmem-symmetric-size) nvshmem_symmetric_size=$2 ;;
                 --out-dir) out_dir=$2 ;;
                 --python) python_bin=$2 ;;
             esac
@@ -120,6 +124,7 @@ if [[ -n $peer ]]; then
     printf -v remote_command '%q ' bash "$script_path" "$config" \
         --master-addr "$master_addr" --master-port "$master_port" --node-rank 1 \
         --nodes "$nodes" --gpus-per-node "$gpus" --modes "$modes" --out-dir "$out_dir" \
+        --nvshmem-symmetric-size "$nvshmem_symmetric_size" \
         --python "$python_bin" "${peer_topology[@]}" -- "${overrides[@]}"
     ssh -o BatchMode=yes -- "$peer" "$remote_command" &
     peer_pid=$!
@@ -128,6 +133,7 @@ fi
 
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export MEMDUAL_REORDER_RANKS=$((nodes == 2 && !single_cross_node_group))
+export NVSHMEM_SYMMETRIC_SIZE="$nvshmem_symmetric_size"
 for index in "${!cases[@]}"; do
     label=${cases[index]}
     mode=${label%-sync}

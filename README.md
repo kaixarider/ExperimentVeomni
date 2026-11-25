@@ -34,6 +34,7 @@ clips exceed your GPU budget.
 MemDual KVF uses NCCL for K/V and NVSHMEM for the Q/O pipeline. Install a
 matching [NVSHMEM4Py and CUDA runtime](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/nvshmem4py-install-proc.html)
 on both nodes before running the matrix.
+The NVSHMEM heap defaults to `6G` per GPU. Use `--nvshmem-symmetric-size 8G` to override it.
 Synthetic KVF pairs each fixed duration with an async-Ulysses baseline. The
 default matrix also runs these pairs with one cross-node Ulysses group at CP 10
 for T2V (5 GPUs per node) and CP 12 for TI2V (6 GPUs per node). Synthetic

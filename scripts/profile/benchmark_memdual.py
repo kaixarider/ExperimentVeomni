@@ -457,6 +457,7 @@ def run_benchmark(trainer, bench):
     slowest_rank = max(range(len(rank_stats)), key=lambda rank: rank_stats[rank][0])
     seconds = rank_stats[slowest_rank][0]
     samples = sum(row[1] for row in rank_stats)
+    kvf_backend = _kvf_backend(trainer.base.args.model)
     result = {
         "mode": bench.mode,
         "data_source": bench.data_source,
@@ -472,7 +473,8 @@ def run_benchmark(trainer, bench):
         else "fixed_samples",
         "attention": "kvf" if bench.mode in ("kvf", "combined") else bench.reference_attention,
         "kvf_query_blocks": trainer.base.args.model.model_config["kvf_query_blocks"],
-        "kvf_backend": _kvf_backend(trainer.base.args.model),
+        "kvf_backend": kvf_backend,
+        "nvshmem_symmetric_size": os.environ.get("NVSHMEM_SYMMETRIC_SIZE") if kvf_backend == "nvshmem" else None,
         "kvf_symmetric_bytes_per_rank": [stats[5] for stats in rank_stats],
         "dp_size": parallel.dp_size,
         "ulysses_size": parallel.ulysses_size,
