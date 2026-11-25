@@ -97,7 +97,8 @@ def parse_args():
     parser.add_argument(
         "--metadata-max-seconds",
         type=float,
-        help="Exclude metadata clips longer than this duration (default: only apply model limits).",
+        default=42,
+        help="Exclude metadata clips longer than this duration (default: 42 seconds).",
     )
     parser.add_argument(
         "--kvf-backend",
@@ -162,9 +163,7 @@ def parse_args():
         parser.error("--dataset-ratios requires a positive weight for each dataset.")
     if args.metadata_samples < sum(args.dataset_ratios):
         parser.error("--metadata-samples must allow at least one complete block of --dataset-ratios.")
-    if args.metadata_max_seconds is not None and (
-        not math.isfinite(args.metadata_max_seconds) or args.metadata_max_seconds <= 0
-    ):
+    if not math.isfinite(args.metadata_max_seconds) or args.metadata_max_seconds <= 0:
         parser.error("--metadata-max-seconds must be finite and positive.")
     if args.trace_max_seconds <= 20:
         parser.error("--trace-max-seconds must be greater than 20.")

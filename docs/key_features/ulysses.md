@@ -661,10 +661,10 @@ Both models use the same sampled video lengths, and all four modes use
 the same ordered latent-frame manifest for their model. The packers
 can change the order and number of samples processed in the measured
 window. Result JSON records the mix, excluded clip counts, and latent-frame
-histogram. The default keeps the duration range supported by both models'
-temporal patch and RoPE limits. Set `--metadata-max-seconds 35`, for example,
-to exclude clips above a duration that fits the test setup. End-to-end
-step time includes latent generation by the data loader.
+histogram. Clips longer than 42 seconds are excluded by default, in
+addition to both models' temporal patch and RoPE limits. Use
+`--metadata-max-seconds` to change the duration cap. End-to-end step
+time includes latent generation by the data loader.
 
 Each model path may be the whole pipeline or the transformer subdirectory.
 A pipeline root selects its `transformer/` component. Pass
@@ -693,13 +693,16 @@ fixed-length and trace-derived runs.
   and `--synthetic-context-tokens` to change the generated geometry.
   Result JSON saves each workload's realized latent-frame histogram.
 
-By default the pack budget is the longest sequence rounded up for SP,
-the long boundary is half the longest sequence, and the fixed target
-for trace-derived and metadata workloads is the longest sequence length squared.
-The launcher accepts `--max-pack-tokens`, `--long-boundary`, and
-`--fixed-target-runtime` overrides. Compare samples per second alongside
-step time when the packing strategies process different numbers of videos
-per step.
+By default the pack token budget is the longest sequence rounded up
+for SP, and the long boundary is half the longest sequence. For
+metadata and trace-derived workloads, fixed-target packing sums each
+sample's unpadded token length squared and uses the longest sample's
+length squared as the target. Each workload uses one target. An
+individual sample above the target runs alone. The fixed-duration KVF
+pairs use fixed sample counts. The launcher accepts `--max-pack-tokens`,
+`--long-boundary`, and `--fixed-target-runtime` overrides. Compare
+samples per second alongside step time when the packing strategies
+process different numbers of videos per step.
 
 - E2E time is the maximum rank wall time over a complete measurement window
   of `DiTTrainer.train_step` calls. It includes data loading, the SP broadcast,

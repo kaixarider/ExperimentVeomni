@@ -29,8 +29,8 @@ python scripts/profile/run_memdual_matrix.py \
 
 The metadata experiments use clip durations from the three datasets to generate
 Wan latents and text embeddings. Set `--dataset-ratios A:B:C` in dataset order
-to change the default equal mix. Use `--metadata-max-seconds` if the longest
-clips exceed your GPU budget.
+to change the default equal mix. Metadata clips are capped at 42 seconds by default.
+Use `--metadata-max-seconds` to change the cap.
 MemDual KVF uses NCCL for K/V and NVSHMEM for the Q/O pipeline. Install a
 matching [NVSHMEM4Py and CUDA runtime](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/nvshmem4py-install-proc.html)
 on both nodes before running the matrix.
